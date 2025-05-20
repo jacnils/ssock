@@ -84,7 +84,7 @@ namespace ssock::sock {
          * @brief Returns true if the socket handle is valid.
          * @return True if the socket handle is valid, false otherwise.
          */
-        bool is_valid() const {
+        [[nodiscard]] bool is_valid() const noexcept {
             return valid;
         }
 
@@ -156,9 +156,7 @@ namespace ssock::sock {
                     throw std::runtime_error("sock_addr(): invalid hostname");
                 }
                 type = sock_addr_type::ipv6;
-            } else if (t == sock_addr_type::ipv4) {
-                ip = hostname;
-            } else if (t == sock_addr_type::ipv6) {
+            } else if (t == sock_addr_type::ipv4 || t == sock_addr_type::ipv6) {
                 ip = hostname;
             } else {
                 throw std::runtime_error("sock_addr(): invalid address type");
@@ -186,14 +184,14 @@ namespace ssock::sock {
          * @brief Check whether the address is IPv4 or IPv6.
          * @return True if the address is IPv4, false if it is IPv6 or invalid.
          */
-        bool is_ipv4() const {
+        [[nodiscard]] bool is_ipv4() const noexcept {
             return type == sock_addr_type::ipv4;
         }
         /**
          * @brief Check whether the address is IPv6.
          * @return True if the address is IPv6, false if it is IPv4 or invalid.
          */
-        bool is_ipv6() const {
+        [[nodiscard]] bool is_ipv6() const noexcept {
             return type == sock_addr_type::ipv6;
         }
         /**
@@ -208,7 +206,7 @@ namespace ssock::sock {
          * @brief Get the stored IP address.
          * @return The stored IP address.
          */
-        std::string get_ip() const {
+        [[nodiscard]] std::string get_ip() const noexcept {
             return this->ip;
         }
         /**
@@ -226,7 +224,7 @@ namespace ssock::sock {
          * @brief Get the stored hostname.
          * @return The stored hostname.
          */
-        std::string get_hostname() const {
+        [[nodiscard]] std::string get_hostname() const {
             if (hostname.empty()) {
                 throw std::runtime_error("hostname is empty, use get_ip() instead");
             }
@@ -236,27 +234,51 @@ namespace ssock::sock {
          * @brief Get the stored port.
          * @return The stored port.
          */
-        int get_port() const {
+        [[nodiscard]] int get_port() const noexcept {
             return port;
         }
         ~sock_addr() = default;
     };
 
+    class basic_sync_sock {
+      public:
+        basic_sync_sock() = default;
+        virtual ~basic_sync_sock() = 0;
+        basic_sync_sock(const basic_sync_sock&) = delete;
+
+        virtual void connect() const = 0;
+        virtual void bind() = 0;
+        virtual void unbind() = 0;
+        virtual void listen(int backlog) const = 0;
+        virtual sock_handle accept() = 0;
+        virtual int send(const void* buf, size_t len, const sock_handle& h) const = 0;
+        virtual int send(const void* buf, size_t len) const = 0;
+        virtual void send(const std::string& buf, const sock_handle& h) const = 0;
+        virtual void send(const std::string& buf) const = 0;
+        [[nodiscard]] virtual std::string recv(int timeout_seconds, const sock_handle& h) const = 0;
+        [[nodiscard]] virtual std::string recv_line(const sock_handle& h) const = 0;
+        [[nodiscard]] virtual std::string recv(int timeout_seconds) const = 0;
+        [[nodiscard]] virtual std::string recv() const = 0;
+        [[nodiscard]] virtual std::string recv_line() const = 0;
+        virtual void close(const sock_handle& handle) const = 0;
+        virtual void close() const = 0;
+    };
+
     /**
      * @brief A class that represents a synchronous socket.
      */
-    class sync_sock {
+    class sync_sock : private basic_sync_sock {
         sock_addr addr;
         sock_type type{};
         int sockfd{};
         sockaddr_storage sa_storage{};
         bool bound{false};
 
-        const sockaddr* get_sa() const {
+        [[nodiscard]] const sockaddr* get_sa() const {
             return reinterpret_cast<const sockaddr*>(&sa_storage);
         }
 
-        socklen_t get_sa_len() const {
+        [[nodiscard]] socklen_t get_sa_len() const {
             if (addr.is_ipv4()) return sizeof(sockaddr_in);
             if (addr.is_ipv6()) return sizeof(sockaddr_in6);
             throw std::runtime_error("Invalid address type");
@@ -265,14 +287,14 @@ namespace ssock::sock {
         void prep_sa() {
             memset(&sa_storage, 0, sizeof(sa_storage));
             if (addr.is_ipv4()) {
-                sockaddr_in* sa4 = reinterpret_cast<sockaddr_in*>(&sa_storage);
+                auto* sa4 = reinterpret_cast<sockaddr_in*>(&sa_storage);
                 sa4->sin_family = AF_INET;
                 sa4->sin_port = htons(addr.get_port());
                 if (inet_pton(AF_INET, addr.get_ip().c_str(), &sa4->sin_addr) <= 0) {
                     throw std::runtime_error("Invalid IPv4 address");
                 }
             } else if (addr.is_ipv6()) {
-                sockaddr_in6* sa6 = reinterpret_cast<sockaddr_in6*>(&sa_storage);
+                auto* sa6 = reinterpret_cast<sockaddr_in6*>(&sa_storage);
                 sa6->sin6_family = AF_INET6;
                 sa6->sin6_port = htons(addr.get_port());
                 if (inet_pton(AF_INET6, addr.get_ip().c_str(), &sa6->sin6_addr) <= 0) {
@@ -302,7 +324,7 @@ namespace ssock::sock {
 
             this->prep_sa();
         }
-        ~sync_sock() {
+        ~sync_sock() override {
             ::net_close(sockfd);
         }
         /**
@@ -316,13 +338,13 @@ namespace ssock::sock {
          * @brief Get the socket address.
          * @return const sock_addr& reference
          */
-        const sock_addr& get_addr() const {
+        [[nodiscard]] const sock_addr& get_addr() const {
             return this->addr;
         }
         /**
          * @brief Connect the socket to the server.
          */
-        void connect() const {
+        void connect() const override {
             if (::net_connect(this->sockfd, this->get_sa(), this->get_sa_len()) < 0) {
                 throw std::runtime_error("failed to connect to server");
             }
@@ -330,7 +352,7 @@ namespace ssock::sock {
         /**
          * @brief Bind the socket to the address.
          */
-        void bind() {
+        void bind() override {
             this->bound = true;
 
             sockaddr_in addr{};
@@ -358,7 +380,7 @@ namespace ssock::sock {
         /**
          * @brief Unbind the socket from the address.
          */
-        void unbind() {
+        void unbind() override {
             if (this->bound) {
                 if (::net_close(this->sockfd) < 0) {
                     throw std::runtime_error("failed to unbind socket");
@@ -371,7 +393,7 @@ namespace ssock::sock {
          * @param backlog The maximum number of pending connections (default is 5).
          * @note Very barebones, use with care.
          */
-        void listen(int backlog = 5) const {
+        void listen(int backlog) const override {
             if (::net_listen(this->sockfd, backlog) < 0) {
                 throw std::runtime_error("failed to listen on socket");
             }
@@ -380,7 +402,7 @@ namespace ssock::sock {
          * @brief Accept a connection from a client.
          * @return sock_handle The socket handle for the accepted connection.
          */
-        [[nodiscard]] sock_handle accept() {
+        [[nodiscard]] sock_handle accept() override {
             sockaddr_storage client_addr{};
             socklen_t addr_len = sizeof(client_addr);
 
@@ -403,23 +425,36 @@ namespace ssock::sock {
          * @brief Send data to the server.
          * @param buf The data to send.
          * @param len The length of the data.
-         * @param h The socket handle to use (default is the current socket).
+         * @param h The socket handle to use.
          * @return The number of bytes sent.
          */
-        int send(const void* buf, size_t len, const sock_handle& h = {}) const {
-            int ret = ::net_send((bound && h.is_valid()) ? h.sockfd : this->sockfd, buf, len, 0);
-            if (ret < 0) {
-                throw std::runtime_error("failed to send data");
-            }
-            return ret;
+        int send(const void* buf, size_t len, const sock_handle& h) const override {
+            std::size_t ret = ::net_send((bound && h.is_valid()) ? h.sockfd : this->sockfd, buf, len, 0);
+            return static_cast<int>(ret);
+        }
+        /**
+         * @brief Send data to the server.
+         * @param buf The data to send.
+         * @param len The length of the data.
+         * @return The number of bytes sent.
+         */
+        int send(const void* buf, size_t len) const override {
+            return this->send(buf, len, {});
         }
         /**
          * @brief Send a string to the server.
          * @param buf The string to send.
          * @param h The socket handle to use (default is the current socket).
          */
-        void send(const std::string& buf, const sock_handle& h = {}) const {
+        void send(const std::string& buf, const sock_handle& h) const override {
             static_cast<void>(this->send(buf.c_str(), buf.length(), h));
+        }
+        /**
+         * @brief Send a string to the server.
+         * @param buf The string to send.
+         */
+        void send(const std::string& buf) const override {
+            this->send(buf, {});
         }
         /**
          * @brief Receive data from the server.
@@ -427,7 +462,7 @@ namespace ssock::sock {
          * @param h The socket handle to use (default is the current socket).
          * @return The received data as a string.
          */
-        std::string recv(const int timeout_seconds = -1, const sock_handle& h = {}) const {
+        [[nodiscard]] std::string recv(const int timeout_seconds, const sock_handle& h) const override {
             std::string data;
 
             while (true) {
@@ -435,7 +470,7 @@ namespace ssock::sock {
                 FD_ZERO(&readfds);
                 FD_SET((bound && h.is_valid()) ? h.sockfd : this->sockfd, &readfds);
 
-                timeval tv;
+                timeval tv{};
                 timeval* tv_ptr = nullptr;
 
                 if (timeout_seconds >= 0) {
@@ -454,10 +489,7 @@ namespace ssock::sock {
                 }
                 if (FD_ISSET(this->sockfd, &readfds)) {
                     char buf[1024];
-                    int received = ::net_recv((bound && h.is_valid()) ? h.sockfd : this->sockfd, buf, sizeof(buf), 0);
-                    if (received < 0) {
-                        throw std::runtime_error("failed to receive data");
-                    }
+                    std::size_t received = ::net_recv((bound && h.is_valid()) ? h.sockfd : this->sockfd, buf, sizeof(buf), 0);
                     if (received == 0) {
                         break;
                     }
@@ -468,18 +500,30 @@ namespace ssock::sock {
             return data;
         }
         /**
+         * @brief Receive data from the server.
+         * @param timeout_seconds The timeout in seconds (default is -1, which means no timeout).
+         * @return The received data as a string.
+         */
+        [[nodiscard]] std::string recv(const int timeout_seconds) const override {
+            return this->recv(timeout_seconds, {});
+        }
+        /**
+         * @brief Receive data from the server.
+         * @return The received data as a string.
+         */
+        [[nodiscard]] std::string recv() const override {
+            return this->recv(-1, {});
+        }
+        /**
          * @brief Receive a line of data from the server.
          * @param h The socket handle to use (default is the current socket).
          * @return The received line as a string.
          */
-        std::string recv_line(const sock_handle& h = {}) const {
+        [[nodiscard]] std::string recv_line(const sock_handle& h) const override {
             std::string line;
             char c;
             while (true) {
-                int ret = ::net_recv((bound && h.is_valid()) ? h.sockfd : this->sockfd, &c, 1, 0);
-                if (ret < 0) {
-                    throw std::runtime_error("failed to receive data");
-                }
+                std::size_t ret = ::net_recv((bound && h.is_valid()) ? h.sockfd : this->sockfd, &c, 1, 0);
                 if (ret == 0 || c == '\n') {
                     break;
                 }
@@ -487,14 +531,23 @@ namespace ssock::sock {
             }
             return line;
         }
+        [[nodiscard]] std::string recv_line() const override {
+            return this->recv_line({});
+        }
         /**
          * @brief Close the socket.
          * @param handle The socket handle to close (default is the current socket).
          */
-        void close(const sock_handle& handle = {}) const {
+        void close(const sock_handle& handle) const override {
             if (::net_close((bound && handle.is_valid()) ? handle.sockfd : this->sockfd) < 0) {
                 throw std::runtime_error("failed to close socket");
             }
+        }
+        /**
+         * @brief Close the socket.
+         */
+        void close() const override {
+            this->close({});
         }
     };
 
@@ -516,10 +569,10 @@ namespace ssock::sock {
 
             void* addr{};
             if (p->ai_family == AF_INET) {
-                sockaddr_in* ipv4 = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+                auto* ipv4 = reinterpret_cast<sockaddr_in*>(p->ai_addr);
                 addr = &(ipv4->sin_addr);
             } else if (p->ai_family == AF_INET6) {
-                sockaddr_in6* ipv6 = reinterpret_cast<sockaddr_in6*>(p->ai_addr);
+                auto* ipv6 = reinterpret_cast<sockaddr_in6*>(p->ai_addr);
                 addr = &(ipv6->sin6_addr);
             } else {
                 freeaddrinfo(res);
@@ -603,7 +656,7 @@ namespace ssock::http {
          * @brief Constructs a basic_body_parser object.
          * @param body The body to parse.
          */
-        basic_body_parser(std::string& body) : body(body) {}
+        explicit basic_body_parser(std::string& body) : body(body) {}
         /**
          * @brief Parse the body.
          * @return The parsed response (reference)
@@ -642,7 +695,7 @@ namespace ssock::http {
             std::string line{};
             while (std::getline(headers_stream, line)) {
                 if (line.back() == '\r') line.pop_back();
-                const auto cpos = line.find(":");
+                const auto cpos = line.find(':');
                 if (cpos != std::string::npos) {
                     auto key = line.substr(0, cpos);
                     auto value = line.substr(cpos + 1);
@@ -690,7 +743,7 @@ namespace ssock::http {
         std::string body{};
         int timeout{-1};
 
-        std::string make_request(const std::string& request) const {
+        [[nodiscard]] std::string make_request(const std::string& request) const noexcept {
             ssock::sock::sock_addr addr(hostname, port, ssock::sock::sock_addr_type::hostname_ipv4);
             ssock::sock::sync_sock sock(addr, ssock::sock::sock_type::tcp);
             sock.connect();
@@ -836,61 +889,61 @@ namespace ssock::http {
          * @brief Get the request headers.
          * @return The request headers as a vector of key-value pairs.
          */
-        std::vector<std::pair<std::string, std::string>> get_headers() const {
+        [[nodiscard]] std::vector<std::pair<std::string, std::string>> get_headers() const noexcept {
             return this->headers;
         }
         /**
          * @brief Get the request body.
          * @return The request body as a string.
          */
-        std::string get_body() const {
+        [[nodiscard]] std::string get_body() const noexcept {
             return this->body;
         }
         /**
          * @brief Get the request hostname.
          * @return The request hostname as a string.
          */
-        std::string get_hostname() const {
+        [[nodiscard]] std::string get_hostname() const noexcept {
             return this->hostname;
         }
         /**
          * @brief Get the request path.
          * @return The request path as a string.
          */
-        std::string get_path() const {
+        [[nodiscard]] std::string get_path() const noexcept {
             return this->path;
         }
         /**
          * @brief Get the request port.
          * @return The request port as an integer.
          */
-        int get_port() const {
+        [[nodiscard]] int get_port() const noexcept {
             return this->port;
         }
         /**
          * @brief Get the request method.
          * @return The request method as a method enum.
          */
-        method get_method() const {
+        [[nodiscard]] method get_method() const noexcept {
             return this->m;
         }
         /**
          * @brief Get the request version.
          * @return The request version as a version enum.
          */
-        version get_version() const {
+        [[nodiscard]] version get_version() const noexcept {
             return this->v;
         }
         /**
          * @brief Get the response from the server.
          * @return response object, parsed.
          */
-        response get() const {
+        [[nodiscard]] response get() const {
             std::string body{};
             body += this->method_str + " " + this->path + " " + this->version_str + "\r\n";
 
             for (const auto& [key, value] : this->headers) {
-                body += key + ": " + value + "\r\n";
+                body += key + ": " += value + "\r\n";
             }
 
             body += "Host: " + this->hostname + "\r\n";

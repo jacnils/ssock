@@ -44,3 +44,6 @@ install(TARGETS ssock
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
 )
+
+add_executable(ssock-build-test test_header.cpp)
+include_directories(include)
