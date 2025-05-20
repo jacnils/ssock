@@ -644,12 +644,23 @@ namespace ssock::http {
      */
     static std::string decode_chunked(const std::string& encoded);
 
+    template <typename T = std::istringstream, typename R = response>
+    class basic_body_parser {
+        T& input;
+        R ret{};
+    public:
+        explicit basic_body_parser(T& input) : input(input), ret({}) {}
+        virtual ~basic_body_parser() = 0;
+        virtual R& parse() = 0;
+    };
+
     /**
      * @brief Basic HTTP body parser.
      * @note Splits the body into headers and body.
      */
-    template <typename T = std::istringstream>
-    class basic_body_parser {
+    template <typename T = std::istringstream,
+              typename R = response>
+    class body_parser : basic_body_parser<T, R> {
         T& input;
         response ret{};
     public:
@@ -657,13 +668,13 @@ namespace ssock::http {
          * @brief Constructs a basic_body_parser object.
          * @param input The body to parse.
          */
-        explicit basic_body_parser(T& input) : input(input), ret({}) {}
+        explicit body_parser(T& input) : input(input), ret({}), basic_body_parser<T,R>(input) {}
         /**
          * @brief Parse the body.
          * @return The parsed response (reference)
          */
-        response& parse() {
-            this->ret = response{};
+        [[nodiscard]] R& parse() override {
+            this->ret = R{};
 
             const auto pos = input.find("\r\n\r\n");
             if (pos == std::string::npos) {
@@ -964,7 +975,7 @@ namespace ssock::http {
             input.close();
 #endif
 
-            basic_body_parser parser{ret};
+            body_parser parser{ret};
 
             return parser.parse();
         }
