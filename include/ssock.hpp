@@ -7,6 +7,9 @@
  */
 #pragma once
 
+#include <sstream>
+#include <string>
+
 #ifndef SSOCK
 #define SSOCK 1
 #endif
@@ -30,9 +33,6 @@
 #else // Nintendo Wii support
 #include <network.h>
 #endif
-
-#include <string>
-#include <sstream>
 
 /**
  * @brief Namespace for the ssock library.
@@ -648,30 +648,29 @@ namespace ssock::http {
      * @brief Basic HTTP body parser.
      * @note Splits the body into headers and body.
      */
+    template <typename T = std::istringstream>
     class basic_body_parser {
-        std::string& body;
+        T& input;
         response ret{};
     public:
         /**
          * @brief Constructs a basic_body_parser object.
-         * @param body The body to parse.
+         * @param input The body to parse.
          */
-        explicit basic_body_parser(std::string& body) : body(body) {}
+        explicit basic_body_parser(T& input) : input(input), ret({}) {}
         /**
          * @brief Parse the body.
          * @return The parsed response (reference)
          */
         response& parse() {
-            ret = response{};
-#ifdef SSOCK_DEBUG
-            ret.raw_body = body;
-#endif
-            const auto pos = body.find("\r\n\r\n");
+            this->ret = response{};
+
+            const auto pos = input.find("\r\n\r\n");
             if (pos == std::string::npos) {
                 throw std::runtime_error("no header terminator");
             }
-            std::string headers_str = body.substr(0, pos);
-            body = body.substr(pos + 4); // skip the \r\n\r\n
+            std::string headers_str = input.substr(0, pos);
+            input = input.substr(pos + 4); // skip the \r\n\r\n
 
             // get status code
             std::istringstream headers_stream(headers_str);
@@ -713,14 +712,14 @@ namespace ssock::http {
             bool is_enc{false};
             for (const auto& [key, val] : ret.headers) {
                 if (key == "Transfer-Encoding" && val.find("chunked") != std::string::npos) {
-                    ret.body = std::move(decode_chunked(body));
+                    ret.body = std::move(decode_chunked(input));
                     is_enc = true;
                     break;
                 }
             }
 
             if (!is_enc) {
-                ret.body = body;
+                ret.body = input;
             }
 
             return ret;
