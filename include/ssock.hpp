@@ -14,58 +14,96 @@
 #define SSOCK 1
 #endif
 
-#ifndef __DEVKITPPC__
+#if defined(__unix__) || defined(__unix) || defined(__APPLE__) && defined(__MACH__)
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-
-#define net_gethostbyname gethostbyname
-#define net_connect connect
-#define net_socket socket
-#define net_send send
-#define net_recv recv
-#define net_close close
-#define net_listen listen
-#define net_bind bind
-#define net_accept accept
-#define net_select select
-#else // Nintendo Wii support
-#include <network.h>
+#else
+#error "Unsupported platform. Please file a pull request to add support for your platform."
 #endif
+
+namespace ssock::internal_net {
+#if defined(__unix__) || defined(__unix) || defined(__APPLE__) && defined(__MACH__)
+    static constexpr auto sys_net_gethostbyname = gethostbyname;
+    static constexpr auto sys_net_connect = connect;
+    static constexpr auto sys_net_socket = socket;
+    static constexpr auto sys_net_send = send;
+    static constexpr auto sys_net_recv = recv;
+    static constexpr auto sys_net_close = close;
+    static constexpr auto sys_net_listen = listen;
+    static constexpr auto sys_net_bind = bind;
+    static constexpr auto sys_net_accept = accept;
+    static constexpr auto sys_net_select = select;
+#endif
+}
 
 /**
  * @brief Namespace for the ssock library.
  */
 namespace ssock::sock {
     /**
+     * @brief Socket file descriptor type.
+     * @note This is a typedef for int, but can be changed to a different type if needed.
+     */
+    using sock_fd_t = int;
+    /**
      * @brief Socket address types.
      * @note Use ipv4/ipv6 for IP addresses, and hostname_ipv4/hostname_ipv6 for hostnames, depending on the address type.
      * @note If you are unsure but have a hostname, use hostname_ipv4.
      */
     enum class sock_addr_type {
-        ipv4,
-        ipv6,
-        hostname_ipv4,
-        hostname_ipv6,
-        hostname = hostname_ipv4,
+        ipv4, /* IPv4 address */
+        ipv6, /* IPv6 address */
+        hostname_ipv4, /* Hostname; resolve to IPv4 address */
+        hostname_ipv6, /* Hostname; resolve to IPv6 address */
+        hostname = hostname_ipv4, /* Hostname; resolve to IPv4 address */
     };
 
     /**
      * @brief Socket types.
      */
     enum class sock_type {
-        tcp,
-        udp,
+        tcp, /* TCP socket */
+        udp, /* UDP socket */
     };
 
     /**
      * @brief A struct that contains the IPv4 and IPv6 addresses of a hostname.
      * @note Use resolve_hostname() to get the addresses.
      */
-    struct sock_ip_list {
+    class sock_ip_list final {
+    protected:
         std::string v4{};
         std::string v6{};
+        friend class sync_sock;
+    public:
+        explicit sock_ip_list() = default;
+        sock_ip_list(std::string v4, std::string v6) : v4(std::move(v4)), v6(std::move(v6)) {}
+        [[nodiscard]] bool contains_ipv4() const noexcept {
+            return !v4.empty();
+        }
+        [[nodiscard]] bool contains_ipv6() const noexcept {
+            return !v6.empty();
+        }
+        [[nodiscard]] std::string get_ipv4() const {
+            if (!this->contains_ipv4()) {
+                throw std::runtime_error("sock_ip_list(): no IPv4 address");
+            }
+            return v4;
+        }
+        [[nodiscard]] std::string get_ipv6() const {
+            if (!this->contains_ipv6()) {
+                throw std::runtime_error("sock_ip_list(): no IPv6 address");
+            }
+            return v6;
+        }
+        [[nodiscard]] std::string get_ip() const {
+            if (v4.empty() && v6.empty()) {
+                throw std::runtime_error("sock_ip_list(): no IP address");
+            }
+            return v6.empty() ? v4 : v6;
+        }
     };
 
     /**
@@ -73,13 +111,12 @@ namespace ssock::sock {
      * @note This class is used internally by the sync_sock class.
      * @note Only useful for binding and accepting connections.
      */
-    class sock_handle {
-        int sockfd{};
+    class sock_handle final {
+        sock_fd_t sfd{};
         bool valid{false};
         friend class sync_sock;
     public:
         sock_handle() = default;
-
         /**
          * @brief Returns true if the socket handle is valid.
          * @return True if the socket handle is valid, false otherwise.
@@ -87,10 +124,9 @@ namespace ssock::sock {
         [[nodiscard]] bool is_valid() const noexcept {
             return valid;
         }
-
         ~sock_handle() {
             if (valid) {
-                net_close(sockfd);
+                internal_net::sys_net_close(sfd);
             }
         }
     };
@@ -127,7 +163,7 @@ namespace ssock::sock {
      * @param port The port to use.
      * @param t The address type (ipv4, ipv6, hostname_ipv4, hostname_ipv6).
      */
-    class sock_addr {
+    class sock_addr final {
         std::string hostname{};
         std::string ip{};
         int port{};
@@ -139,19 +175,20 @@ namespace ssock::sock {
          * @param port The port to use.
          * @param t The address type (ipv4, ipv6, hostname_ipv4, hostname_ipv6).
          */
-        sock_addr(const std::string& hostname, int port, sock_addr_type t) : port(port) {
+        sock_addr(const std::string& hostname, int port, sock_addr_type t) : hostname(hostname), port(port) {
             if (t == sock_addr_type::hostname) {
-                ip = resolve_hostname(hostname, port).v4;
-                this->hostname = hostname;
+                ip = resolve_hostname(hostname, port).get_ipv6();
+                type = sock_addr_type::ipv6;
                 if (ip.empty()) {
-                    ip = resolve_hostname(hostname, port).v6;
-                    type = sock_addr_type::ipv6;
-                } else {
+                    ip = resolve_hostname(hostname, port).get_ipv4();
                     type = sock_addr_type::ipv4;
+
+                    if (ip.empty()) {
+                        throw std::runtime_error("sock_addr(): invalid hostname or failed to resolve");
+                    }
                 }
             } else if (t == sock_addr_type::hostname_ipv6) {
-                ip = resolve_hostname(hostname, port).v6;
-                this->hostname = hostname;
+                ip = resolve_hostname(hostname, port).get_ipv6();
                 if (ip.empty()) {
                     throw std::runtime_error("sock_addr(): invalid hostname");
                 }
@@ -162,7 +199,6 @@ namespace ssock::sock {
                 throw std::runtime_error("sock_addr(): invalid address type");
             }
 
-            // validate
             if (this->type == sock_addr_type::ipv4) {
                 if (!ssock::sock::is_ipv4(ip)) {
                     throw std::runtime_error("sock_addr(): invalid IPv4 address");
@@ -175,6 +211,7 @@ namespace ssock::sock {
                 throw std::runtime_error("sock_addr(): invalid address type (validation)");
             }
 
+            // signifies that we don't have a hostname since we have an IP address
             if (this->hostname == ip) {
                 this->hostname.clear();
             }
@@ -243,7 +280,7 @@ namespace ssock::sock {
     class basic_sync_sock {
       public:
         basic_sync_sock() = default;
-        virtual ~basic_sync_sock() = 0;
+        virtual ~basic_sync_sock() = default;
         basic_sync_sock(const basic_sync_sock&) = delete;
 
         virtual void connect() const = 0;
@@ -267,7 +304,7 @@ namespace ssock::sock {
     /**
      * @brief A class that represents a synchronous socket.
      */
-    class sync_sock : private basic_sync_sock {
+    class sync_sock final : basic_sync_sock {
         sock_addr addr;
         sock_type type{};
         int sockfd{};
@@ -281,6 +318,7 @@ namespace ssock::sock {
         [[nodiscard]] socklen_t get_sa_len() const {
             if (addr.is_ipv4()) return sizeof(sockaddr_in);
             if (addr.is_ipv6()) return sizeof(sockaddr_in6);
+
             throw std::runtime_error("Invalid address type");
         }
 
@@ -315,8 +353,8 @@ namespace ssock::sock {
                 throw std::runtime_error("IP address is empty");
             }
 
-            this->sockfd = net_socket(addr.is_ipv4() ? AF_INET : AF_INET6,
-                                      t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
+            this->sockfd = internal_net::sys_net_socket(addr.is_ipv4() ? AF_INET : AF_INET6,
+                                                              t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
 
             if (this->sockfd < 0) {
                 throw std::runtime_error("failed to create socket");
@@ -325,7 +363,7 @@ namespace ssock::sock {
             this->prep_sa();
         }
         ~sync_sock() override {
-            ::net_close(sockfd);
+            internal_net::sys_net_close(sockfd);
         }
         /**
          * @brief Get the socket address.
@@ -345,7 +383,7 @@ namespace ssock::sock {
          * @brief Connect the socket to the server.
          */
         void connect() const override {
-            if (::net_connect(this->sockfd, this->get_sa(), this->get_sa_len()) < 0) {
+            if (internal_net::sys_net_connect(this->sockfd, this->get_sa(), this->get_sa_len()) < 0) {
                 throw std::runtime_error("failed to connect to server");
             }
         }
@@ -371,7 +409,7 @@ namespace ssock::sock {
                 inet_pton(addr6.sin6_family, this->addr.get_ip().c_str(), &addr6.sin6_addr);
             }
 
-            auto ret = ::net_bind(this->sockfd, this->get_sa(), this->get_sa_len());
+            auto ret = internal_net::sys_net_bind(this->sockfd, this->get_sa(), this->get_sa_len());
 
             if (ret < 0) {
                 throw std::runtime_error("failed to bind socket: " + std::to_string(ret));
@@ -382,7 +420,7 @@ namespace ssock::sock {
          */
         void unbind() override {
             if (this->bound) {
-                if (::net_close(this->sockfd) < 0) {
+                if (internal_net::sys_net_close(this->sockfd) < 0) {
                     throw std::runtime_error("failed to unbind socket");
                 }
                 this->bound = false;
@@ -394,7 +432,7 @@ namespace ssock::sock {
          * @note Very barebones, use with care.
          */
         void listen(int backlog) const override {
-            if (::net_listen(this->sockfd, backlog) < 0) {
+            if (internal_net::sys_net_listen(this->sockfd, backlog) < 0) {
                 throw std::runtime_error("failed to listen on socket");
             }
         }
@@ -406,13 +444,13 @@ namespace ssock::sock {
             sockaddr_storage client_addr{};
             socklen_t addr_len = sizeof(client_addr);
 
-            int client_sockfd = ::net_accept(this->sockfd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+            int client_sockfd = internal_net::sys_net_accept(this->sockfd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
             if (client_sockfd < 0) {
                 throw std::runtime_error("failed to accept connection");
             }
 
             sock_handle handle;
-            handle.sockfd = client_sockfd;
+            handle.sfd = client_sockfd;
             handle.valid = true;
 
             if (bound) {
@@ -429,7 +467,7 @@ namespace ssock::sock {
          * @return The number of bytes sent.
          */
         int send(const void* buf, size_t len, const sock_handle& h) const override {
-            std::size_t ret = ::net_send((bound && h.is_valid()) ? h.sockfd : this->sockfd, buf, len, 0);
+            std::size_t ret = internal_net::sys_net_send((bound && h.is_valid()) ? h.sfd : this->sockfd, buf, len, 0);
             return static_cast<int>(ret);
         }
         /**
@@ -468,7 +506,7 @@ namespace ssock::sock {
             while (true) {
                 fd_set readfds;
                 FD_ZERO(&readfds);
-                FD_SET((bound && h.is_valid()) ? h.sockfd : this->sockfd, &readfds);
+                FD_SET((bound && h.is_valid()) ? h.sfd : this->sockfd, &readfds);
 
                 timeval tv{};
                 timeval* tv_ptr = nullptr;
@@ -479,7 +517,7 @@ namespace ssock::sock {
                     tv_ptr = &tv;
                 }
 
-                int ret = net_select((bound && h.is_valid()) ? h.sockfd : this->sockfd + 1, &readfds, nullptr, nullptr, tv_ptr);
+                int ret = internal_net::sys_net_select((bound && h.is_valid()) ? h.sfd : this->sockfd + 1, &readfds, nullptr, nullptr, tv_ptr);
 
                 if (ret < 0) {
                     throw std::runtime_error("select() failed");
@@ -489,7 +527,7 @@ namespace ssock::sock {
                 }
                 if (FD_ISSET(this->sockfd, &readfds)) {
                     char buf[1024];
-                    std::size_t received = ::net_recv((bound && h.is_valid()) ? h.sockfd : this->sockfd, buf, sizeof(buf), 0);
+                    std::size_t received = internal_net::sys_net_recv((bound && h.is_valid()) ? h.sfd : this->sockfd, buf, sizeof(buf), 0);
                     if (received == 0) {
                         break;
                     }
@@ -523,7 +561,7 @@ namespace ssock::sock {
             std::string line;
             char c;
             while (true) {
-                std::size_t ret = ::net_recv((bound && h.is_valid()) ? h.sockfd : this->sockfd, &c, 1, 0);
+                std::size_t ret = internal_net::sys_net_recv((bound && h.is_valid()) ? h.sfd : this->sockfd, &c, 1, 0);
                 if (ret == 0 || c == '\n') {
                     break;
                 }
@@ -539,7 +577,7 @@ namespace ssock::sock {
          * @param handle The socket handle to close (default is the current socket).
          */
         void close(const sock_handle& handle) const override {
-            if (::net_close((bound && handle.is_valid()) ? handle.sockfd : this->sockfd) < 0) {
+            if (internal_net::sys_net_close((bound && handle.is_valid()) ? handle.sfd : this->sockfd) < 0) {
                 throw std::runtime_error("failed to close socket");
             }
         }
@@ -562,7 +600,8 @@ namespace ssock::sock {
             throw std::runtime_error("resolve_hostname(): function getaddrinfo returned: " + std::string(gai_strerror(status)));
         }
 
-        sock_ip_list list{};
+        std::string v4{};
+        std::string v6{};
 
         for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
             char ipstr[INET6_ADDRSTRLEN];
@@ -581,15 +620,15 @@ namespace ssock::sock {
 
             inet_ntop(p->ai_family, addr, ipstr, sizeof(ipstr));
             if (p->ai_family == AF_INET) {
-                list.v4 = ipstr;
+                v4 = ipstr;
             } else if (p->ai_family == AF_INET6) {
-                list.v6 = ipstr;
+                v6 = ipstr;
             }
         }
 
         freeaddrinfo(res);
 
-        return list;
+        return {std::move(v4), std::move(v6)};
     }
 
     static bool is_ipv4(const std::string& ip) {
@@ -631,25 +670,22 @@ namespace ssock::http {
     struct response {
         int status_code{};
         std::string body{};
-#ifdef SSOCK_DEBUG
-        std::string raw_body{};
-#endif
         std::vector<std::pair<std::string, std::string>> headers{};
     };
 
-    /**
-     * @brief A function that decodes chunked transfer encoding.
-     * @param encoded The encoded string.
-     * @return The decoded string.
-     */
-    static std::string decode_chunked(const std::string& encoded);
-
-    template <typename T = std::istringstream, typename R = response>
+    template <typename T = std::istringstream, typename R = response, typename VPS = std::vector<std::pair<T,T>>>
     class basic_body_parser {
         T& input;
         R ret{};
+        VPS headers{};
+        T body{};
     public:
         explicit basic_body_parser(T& input) : input(input), ret({}) {}
+        virtual VPS& get_headers() = 0;
+        virtual T& get_body() = 0;
+        virtual T& get_input() = 0;
+        virtual T decode_chunked(const std::string& encoded) = 0;
+        virtual int get_status_code() = 0;
         virtual ~basic_body_parser() = 0;
         virtual R& parse() = 0;
     };
@@ -659,53 +695,32 @@ namespace ssock::http {
      * @note Splits the body into headers and body.
      */
     template <typename T = std::istringstream,
-              typename R = response>
+              typename R = response,
+              typename VPS = std::vector<std::pair<T,T>>>
     class body_parser : basic_body_parser<T, R> {
         T& input;
-        response ret{};
+        R ret{};
+        VPS headers{};
+        T body{};
     public:
         /**
          * @brief Constructs a basic_body_parser object.
          * @param input The body to parse.
          */
-        explicit body_parser(T& input) : input(input), ret({}), basic_body_parser<T,R>(input) {}
-        /**
-         * @brief Parse the body.
-         * @return The parsed response (reference)
-         */
-        [[nodiscard]] R& parse() override {
-            this->ret = R{};
-
-            const auto pos = input.find("\r\n\r\n");
+        explicit body_parser(T& input) : basic_body_parser<T,R,VPS>(input), input(input), ret({}) {
+            constexpr auto HEADER_END = "\r\n\r\n";
+            const auto pos = input.find(HEADER_END);
             if (pos == std::string::npos) {
                 throw std::runtime_error("no header terminator");
             }
-            std::string headers_str = input.substr(0, pos);
-            input = input.substr(pos + 4); // skip the \r\n\r\n
+            this->body = input.substr(pos + strlen(HEADER_END));
 
-            // get status code
-            std::istringstream headers_stream(headers_str);
-            std::string status_line;
-            if (std::getline(headers_stream, status_line)) {
-                if (status_line.back() == '\r') status_line.pop_back();
-                auto code_pos = status_line.find(' ');
-                if (code_pos != std::string::npos) {
-                    auto code_end = status_line.find(' ', code_pos + 1);
-                    if (code_end != std::string::npos) {
-                        try {
-                            ret.status_code = std::stoi(status_line.substr(code_pos + 1, code_end - code_pos - 1));
-                        } catch (...) {
-                            ret.status_code = -1;
-                        }
-                    }
-                }
-            }
-
-            // get headers
             std::string line{};
-            while (std::getline(headers_stream, line)) {
+            std::istringstream hs(input.substr(0, pos));
+            while (std::getline(hs, line)) {
                 if (line.back() == '\r') line.pop_back();
                 const auto cpos = line.find(':');
+
                 if (cpos != std::string::npos) {
                     auto key = line.substr(0, cpos);
                     auto value = line.substr(cpos + 1);
@@ -715,9 +730,111 @@ namespace ssock::http {
                     };
                     trim(key);
                     trim(value);
-                    ret.headers.emplace_back(key, value);
+
+                    this->headers.emplace_back(key, value);
                 }
             }
+        }
+
+        /**
+         * @brief Decode chunked transfer encoding.
+         * @param encoded The encoded string.
+         * @return The decoded string.
+         */
+        [[nodiscard]] T decode_chunked(const std::string& encoded) override {
+            T dec;
+            size_t pos = 0;
+
+            while (pos < encoded.size()) {
+                size_t crlf = encoded.find("\r\n", pos);
+                if (crlf == std::string::npos) break;
+
+                std::string size_str = encoded.substr(pos, crlf - pos);
+                size_t chunk_size = 0;
+                try {
+                    chunk_size = std::stoul(size_str, nullptr, 16);
+                } catch (...) {
+                    break;
+                }
+
+                if (chunk_size == 0) break;
+
+                pos = crlf + 2;
+                if (pos + chunk_size > encoded.size()) break;
+
+                dec.append(encoded.substr(pos, chunk_size));
+                pos += chunk_size + 2;
+            }
+
+            return dec;
+        }
+        /**
+         * @brief Get the status code from the response.
+         * @return The status code.
+         */
+        [[nodiscard]] int get_status_code() override {
+            if (input.find("HTTP/") == std::string::npos) {
+                throw std::runtime_error("failed to parse status code");
+            }
+            std::string line{};
+            if (input.find('\n') != std::string::npos) {
+                line = input.substr(0, input.find('\n'));
+            } else {
+                line = input;
+            }
+
+            if (line.empty()) {
+                throw std::runtime_error("failed to parse status code");
+            }
+
+            if (line.back() == '\r') line.pop_back();
+
+            std::istringstream iss(line);
+            std::string version{};
+
+            int status_code{};
+
+            iss >> version >> status_code;
+
+            if (iss.fail()) {
+                throw std::runtime_error("failed to parse status code");
+            }
+
+            if (status_code < 100 || status_code > 599) {
+                throw std::runtime_error("invalid status code");
+            }
+
+            return status_code;
+        }
+        /**
+         * @brief Get the input stream.
+         * @return The input stream (reference)
+         */
+        [[nodiscard]] T& get_input() override {
+            return this->input;
+        }
+        /**
+         * @brief Get the body (excluding any headers)
+         */
+        [[nodiscard]] T& get_body() override {
+            return this->body;
+        }
+        /**
+         * @brief Get the headers.
+         * @return The headers (reference)
+         */
+        [[nodiscard]] VPS& get_headers() override {
+            return this->headers;
+        }
+        /**
+         * @brief Parse the body.
+         * @return The parsed response (reference)
+         */
+        [[nodiscard]] R& parse() override {
+            this->ret = R{};
+            this->ret.status_code = get_status_code();
+            this->ret.headers = get_headers();
+            this->ret.body = get_body();
 
             // handle chunked
             bool is_enc{false};
@@ -740,7 +857,7 @@ namespace ssock::http {
     /**
      * @brief A class that represents an HTTP client.
      */
-    class client {
+    class client final {
         std::string hostname{};
         std::string path{};
         int port{};
@@ -754,8 +871,8 @@ namespace ssock::http {
         int timeout{-1};
 
         [[nodiscard]] std::string make_request(const std::string& request) const noexcept {
-            ssock::sock::sock_addr addr(hostname, port, ssock::sock::sock_addr_type::hostname_ipv4);
-            ssock::sock::sync_sock sock(addr, ssock::sock::sock_type::tcp);
+            sock::sock_addr addr(hostname, port, sock::sock_addr_type::hostname_ipv4);
+            sock::sync_sock sock(addr, sock::sock_type::tcp);
             sock.connect();
             sock.send(request);
             return sock.recv(this->timeout);
@@ -966,46 +1083,10 @@ namespace ssock::http {
             }
 
             auto ret = this->make_request(body);
-#ifdef SSOCK_DEBUG
-            std::ofstream file("response.txt");
-            file << ret;
-            file.close();
-            std::ofstream input("request.txt");
-            input << body;
-            input.close();
-#endif
 
             body_parser parser{ret};
 
             return parser.parse();
         }
     };
-
-    static std::string decode_chunked(const std::string& encoded) {
-        std::string decoded;
-        size_t pos = 0;
-
-        while (pos < encoded.size()) {
-            size_t crlf = encoded.find("\r\n", pos);
-            if (crlf == std::string::npos) break;
-
-            std::string size_str = encoded.substr(pos, crlf - pos);
-            size_t chunk_size = 0;
-            try {
-                chunk_size = std::stoul(size_str, nullptr, 16);
-            } catch (...) {
-                break;
-            }
-
-            if (chunk_size == 0) break;
-
-            pos = crlf + 2;
-            if (pos + chunk_size > encoded.size()) break;
-
-            decoded.append(encoded.substr(pos, chunk_size));
-            pos += chunk_size + 2;
-        }
-
-        return decoded;
-    }
 }
