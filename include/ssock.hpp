@@ -19,6 +19,8 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#elif defined(__windows__) || defined(_WIN32) || defined(_WIN64)
+#include <winsock2.h>
 #else
 #error "Unsupported platform. Please file a pull request to add support for your platform."
 #endif
