@@ -9,16 +9,23 @@
 
 #include <sstream>
 #include <string>
+#include <cstring>
+#include <vector>
 
 #ifndef SSOCK
 #define SSOCK 1
 #endif
 
 #if defined(__unix__) || defined(__unix) || defined(__APPLE__) && defined(__MACH__)
+#define SSOCK_UNIX
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#elif defined(__windows__) || defined(_WIN32) || defined(_WIN64)
+#define SSOCK_WIN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #else
 #error "Unsupported platform. Please file a pull request to add support for your platform."
 #endif
@@ -35,6 +42,18 @@ namespace ssock::internal_net {
     static constexpr auto sys_net_bind = bind;
     static constexpr auto sys_net_accept = accept;
     static constexpr auto sys_net_select = select;
+#endif
+#if defined(__windows__) || defined(_WIN32) || defined(_WIN64)
+    static constexpr auto sys_net_gethostbyname = ::gethostbyname;
+    static constexpr auto sys_net_connect = ::connect;
+    static constexpr auto sys_net_socket = ::socket;
+    static constexpr auto sys_net_send = ::send;
+    static constexpr auto sys_net_recv = ::recv;
+    static constexpr auto sys_net_close = ::closesocket;
+    static constexpr auto sys_net_listen = ::listen;
+    static constexpr auto sys_net_bind = ::bind;
+    static constexpr auto sys_net_accept = ::accept;
+    static constexpr auto sys_net_select = ::select;
 #endif
 }
 
@@ -310,6 +329,9 @@ namespace ssock::sock {
         int sockfd{};
         sockaddr_storage sa_storage{};
         bool bound{false};
+#ifdef SSOCK_WIN
+        WSADATA wsa;
+#endif
 
         [[nodiscard]] const sockaddr* get_sa() const {
             return reinterpret_cast<const sockaddr*>(&sa_storage);
@@ -353,6 +375,10 @@ namespace ssock::sock {
                 throw std::runtime_error("IP address is empty");
             }
 
+#ifdef SSOCK_WIN
+            auto result = WSAStartup(MAKEWORD(2, 2), &wsa);)
+#endif
+
             this->sockfd = internal_net::sys_net_socket(addr.is_ipv4() ? AF_INET : AF_INET6,
                                                               t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
 
@@ -363,6 +389,9 @@ namespace ssock::sock {
             this->prep_sa();
         }
         ~sync_sock() override {
+#ifdef SSOCK_WIN
+            WSACleanup();
+#endif
             internal_net::sys_net_close(sockfd);
         }
         /**
