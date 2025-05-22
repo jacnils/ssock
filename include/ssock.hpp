@@ -329,6 +329,9 @@ namespace ssock::sock {
         int sockfd{};
         sockaddr_storage sa_storage{};
         bool bound{false};
+#ifdef SSOCK_WIN
+        WSADATA wsa;
+#endif
 
         [[nodiscard]] const sockaddr* get_sa() const {
             return reinterpret_cast<const sockaddr*>(&sa_storage);
@@ -372,8 +375,8 @@ namespace ssock::sock {
                 throw std::runtime_error("IP address is empty");
             }
 
-#if SSOCK_WIN
-            WSAStartup(2,2);
+#ifdef SSOCK_WIN
+            auto result = WSAStartup(MAKEWORD(2, 2), &wsa);)
 #endif
 
             this->sockfd = internal_net::sys_net_socket(addr.is_ipv4() ? AF_INET : AF_INET6,
@@ -386,6 +389,9 @@ namespace ssock::sock {
             this->prep_sa();
         }
         ~sync_sock() override {
+#ifdef SSOCK_WIN
+            WSACleanup();
+#endif
             internal_net::sys_net_close(sockfd);
         }
         /**
