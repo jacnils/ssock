@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <cstring>
+#include <vector>
 
 #ifndef SSOCK
 #define SSOCK 1
