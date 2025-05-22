@@ -9,6 +9,7 @@
 
 #include <sstream>
 #include <string>
+#include <cstring>
 
 #ifndef SSOCK
 #define SSOCK 1
