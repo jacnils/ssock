@@ -8,7 +8,6 @@ void test_socket() {
     sock.connect();
     sock.send("GET / HTTP/1.1\r\nHost: google.com\r\nConnection: close\r\n\r\n");
     std::string response = sock.recv(-1);
-
     std::cout << response << std::endl;
 }
 

@@ -9,15 +9,19 @@
 
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 #ifndef SSOCK
 #define SSOCK 1
 #endif
+// SSOCK_DEBUG
 
 #if defined(__unix__) || defined(__unix) || defined(__APPLE__) && defined(__MACH__)
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <unistd.h>
 #else
 #error "Unsupported platform. Please file a pull request to add support for your platform."
@@ -53,11 +57,11 @@ namespace ssock::sock {
      * @note If you are unsure but have a hostname, use hostname_ipv4.
      */
     enum class sock_addr_type {
-        ipv4, /* IPv4 address */
-        ipv6, /* IPv6 address */
-        hostname_ipv4, /* Hostname; resolve to IPv4 address */
-        hostname_ipv6, /* Hostname; resolve to IPv6 address */
-        hostname = hostname_ipv4, /* Hostname; resolve to IPv4 address */
+        ipv4 = 0, /* IPv4 address */
+        ipv6 = 1, /* IPv6 address */
+        hostname_ipv4 = 2, /* Hostname; resolve to IPv4 address */
+        hostname_ipv6 = 3, /* Hostname; resolve to IPv6 address */
+        hostname = 4, /* Hostname; resolve to IPv4 address */
     };
 
     /**
@@ -103,6 +107,110 @@ namespace ssock::sock {
                 throw std::runtime_error("sock_ip_list(): no IP address");
             }
             return v6.empty() ? v4 : v6;
+        }
+    };
+
+    class local_ip_address_v4 final {
+    protected:
+        std::string ip{};
+        std::string netmask{};
+        std::string broadcast{};
+        std::string peer{};
+        bool loopback{};
+        bool multicast{};
+    public:
+        local_ip_address_v4() = default;
+        local_ip_address_v4(std::string ip, std::string netmask, std::string broadcast, std::string peer, bool loopback, bool multicast)
+            : ip(std::move(ip)), netmask(std::move(netmask)), broadcast(std::move(broadcast)), peer(std::move(peer)), loopback(loopback), multicast(multicast) {}
+
+        [[nodiscard]] std::string get_ip() const {
+            return ip;
+        }
+        [[nodiscard]] std::string get_netmask() const {
+            return netmask;
+        }
+        [[nodiscard]] std::string get_broadcast() const {
+            return broadcast;
+        }
+        [[nodiscard]] std::string get_peer() const {
+            return peer;
+        }
+        [[nodiscard]] bool is_loopback() const noexcept {
+            return loopback;
+        }
+        [[nodiscard]] bool is_multicast() const noexcept {
+            return multicast;
+        }
+    };
+
+    class local_ip_address_v6 final {
+    protected:
+        std::string ip{};
+        std::string netmask{};
+        bool loopback{};
+        bool multicast{};
+        bool link_local{};
+        std::string scope_id{};
+    public:
+        local_ip_address_v6() = default;
+        local_ip_address_v6(std::string ip, std::string netmask, bool loopback, bool multicast, bool link_local, std::string scope_id)
+            : ip(std::move(ip)), netmask(std::move(netmask)), loopback(loopback), multicast(multicast), link_local(link_local), scope_id(std::move(scope_id)) {}
+
+        [[nodiscard]] std::string get_ip() const {
+            return ip;
+        }
+        [[nodiscard]] std::string get_netmask() const {
+            return netmask;
+        }
+        [[nodiscard]] bool is_loopback() const noexcept {
+            return loopback;
+        }
+        [[nodiscard]] bool is_multicast() const noexcept {
+            return multicast;
+        }
+        [[nodiscard]] bool is_link_local() const noexcept {
+            return link_local;
+        }
+        [[nodiscard]] std::string get_scope_id() const {
+            return scope_id;
+        }
+    };
+
+    class network_interface final {
+    protected:
+        std::vector<local_ip_address_v4> ipv4{};
+        std::vector<local_ip_address_v6> ipv6{};
+        std::string name{};
+
+        bool up{false};
+        bool running{false};
+        bool broadcast{false};
+        bool point_to_point{false};
+
+        friend std::vector<network_interface> get_interfaces();
+    public:
+        network_interface() = default;
+
+        [[nodiscard]] const std::vector<local_ip_address_v4>& get_ipv4_addrs() const noexcept {
+            return ipv4;
+        }
+        [[nodiscard]] const std::vector<local_ip_address_v6>& get_ipv6_addrs() const noexcept {
+            return ipv6;
+        }
+        [[nodiscard]] std::string get_name() const {
+            return name;
+        }
+        [[nodiscard]] bool is_up() const noexcept {
+            return up;
+        }
+        [[nodiscard]] bool is_running() const noexcept {
+            return running;
+        }
+        [[nodiscard]] bool is_broadcast() const noexcept {
+            return broadcast;
+        }
+        [[nodiscard]] bool is_point_to_point() const noexcept {
+            return point_to_point;
         }
     };
 
@@ -156,6 +264,17 @@ namespace ssock::sock {
      * @return True if the port is valid, false otherwise.
      */
     static bool is_valid_port(int port);
+    /**
+     * @brief A function that gets the local network interfaces.
+     * @return A vector of network_interface structs that contain the local network interfaces.
+     */
+    inline std::vector<network_interface> get_interfaces();
+    /**
+     * @brief A function that checks if a usable IPv6 address exists.
+     * @return True if a usable IPv6 address exists, false otherwise.
+     * @note This function checks the local network interfaces for a usable IPv6 address.
+     */
+    static bool usable_ipv6_address_exists();
 
     /**
      * @brief A class that represents a socket address.
@@ -175,43 +294,47 @@ namespace ssock::sock {
          * @param port The port to use.
          * @param t The address type (ipv4, ipv6, hostname_ipv4, hostname_ipv6).
          */
-        sock_addr(const std::string& hostname, int port, sock_addr_type t) : hostname(hostname), port(port) {
-            if (t == sock_addr_type::hostname) {
-                ip = resolve_hostname(hostname, port).get_ipv6();
-                type = sock_addr_type::ipv6;
-                if (ip.empty()) {
-                    ip = resolve_hostname(hostname, port).get_ipv4();
-                    type = sock_addr_type::ipv4;
+        sock_addr(const std::string& hostname, int port, sock_addr_type t) : hostname(hostname), port(port), type(t) {
+            const auto resolve_host = [](const std::string& h, int p, bool t) -> std::string {
+                try {
+                    return t ? resolve_hostname(h, p).get_ipv6() : resolve_hostname(h, p).get_ipv4();
+                } catch (const std::exception&) {
+                    return {};
+                }
+            };
 
-                    if (ip.empty()) {
-                        throw std::runtime_error("sock_addr(): invalid hostname or failed to resolve");
-                    }
+            if (type == sock_addr_type::hostname) {
+                ip = resolve_host(hostname, port, true);
+                type = ssock::sock::sock_addr_type::ipv6;
+
+                if (!ssock::sock::usable_ipv6_address_exists()) {
+                    ip.clear();
                 }
-            } else if (t == sock_addr_type::hostname_ipv6) {
-                ip = resolve_hostname(hostname, port).get_ipv6();
+
                 if (ip.empty()) {
-                    throw std::runtime_error("sock_addr(): invalid hostname");
+                    ip = resolve_host(hostname, port, false);
+                    type = ssock::sock::sock_addr_type::ipv4;
                 }
-                type = sock_addr_type::ipv6;
-            } else if (t == sock_addr_type::ipv4 || t == sock_addr_type::ipv6) {
+            } else if (type == sock_addr_type::hostname_ipv4) {
+                ip = resolve_host(hostname, port, false);
+                type = ssock::sock::sock_addr_type::ipv4;
+            } else if (type == sock_addr_type::hostname_ipv6) {
+                ip = resolve_host(hostname, port, true);
+                type = ssock::sock::sock_addr_type::ipv6;
+            } else if (type == sock_addr_type::ipv4 || type == sock_addr_type::ipv6) {
                 ip = hostname;
             } else {
                 throw std::runtime_error("sock_addr(): invalid address type");
             }
 
-            if (this->type == sock_addr_type::ipv4) {
-                if (!ssock::sock::is_ipv4(ip)) {
-                    throw std::runtime_error("sock_addr(): invalid IPv4 address");
-                }
-            } else if (this->type == sock_addr_type::ipv6) {
-                if (!ssock::sock::is_ipv6(ip)) {
-                    throw std::runtime_error("sock_addr(): invalid IPv6 address");
-                }
-            } else {
-                throw std::runtime_error("sock_addr(): invalid address type (validation)");
+            if (ip.empty()) {
+                throw std::runtime_error("sock_addr(): could not resolve hostname or invalid IP address");
             }
 
-            // signifies that we don't have a hostname since we have an IP address
+            if (!sock::is_ipv4(ip) && !sock::is_ipv6(ip)) {
+                throw std::runtime_error("sock_addr(): invalid address type (constructor)");
+            }
+
             if (this->hostname == ip) {
                 this->hostname.clear();
             }
@@ -277,6 +400,11 @@ namespace ssock::sock {
         ~sock_addr() = default;
     };
 
+    /**
+     * @brief A class that represents a synchronous socket.
+     * @note This class is an abstract base class and should not be instantiated directly.
+     * @note Use the sync_sock class instead.
+     */
     class basic_sync_sock {
       public:
         basic_sync_sock() = default;
@@ -353,7 +481,7 @@ namespace ssock::sock {
                 throw std::runtime_error("IP address is empty");
             }
 
-            this->sockfd = internal_net::sys_net_socket(addr.is_ipv4() ? AF_INET : AF_INET6,
+            this->sockfd = internal_net::sys_net_socket(addr.is_ipv6() ? AF_INET6 : AF_INET,
                                                               t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
 
             if (this->sockfd < 0) {
@@ -588,7 +716,136 @@ namespace ssock::sock {
             this->close({});
         }
     };
+    /**
+     * @brief Get a list of all network interfaces on the system.
+     * @return A vector of network_interface objects.
+     * @throws std::runtime_error if getifaddrs() fails.
+     */
+    inline std::vector<network_interface> get_interfaces() {
+        std::vector<network_interface> list;
 
+        struct ifaddrs* ifaddr;
+        if (getifaddrs(&ifaddr) == -1) {
+            throw std::runtime_error{"getifaddrs() failed in get_interfaces()"};
+        }
+
+        std::unordered_map<std::string, network_interface> iface_map;
+
+        for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr)
+                continue;
+
+            const std::string name(ifa->ifa_name);
+            auto& iface = iface_map[name];
+            iface.name = name;
+
+            iface.up = (ifa->ifa_flags & IFF_UP);
+            iface.running = (ifa->ifa_flags & IFF_RUNNING);
+            iface.broadcast = (ifa->ifa_flags & IFF_BROADCAST);
+            iface.point_to_point = (ifa->ifa_flags & IFF_POINTOPOINT);
+
+            char addr_buf[INET6_ADDRSTRLEN]{};
+            char netmask_buf[INET6_ADDRSTRLEN]{};
+            char broadcast_buf[INET_ADDRSTRLEN]{};
+            char peer_buf[INET_ADDRSTRLEN]{};
+
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                auto sa = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+                if (!inet_ntop(AF_INET, &(sa->sin_addr), addr_buf, sizeof(addr_buf)))
+                    continue;
+
+                if (ifa->ifa_netmask) {
+                    auto netmask = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_netmask);
+                    inet_ntop(AF_INET, &(netmask->sin_addr), netmask_buf, sizeof(netmask_buf));
+                }
+
+                if (ifa->ifa_flags & IFF_BROADCAST && ifa->ifa_broadaddr) {
+                    auto broad = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_broadaddr);
+                    inet_ntop(AF_INET, &(broad->sin_addr), broadcast_buf, sizeof(broadcast_buf));
+                }
+
+                if (ifa->ifa_flags & IFF_POINTOPOINT && ifa->ifa_dstaddr) {
+                    auto peer = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_dstaddr);
+                    inet_ntop(AF_INET, &(peer->sin_addr), peer_buf, sizeof(peer_buf));
+                }
+
+                local_ip_address_v4 addr{
+                    std::string(addr_buf),
+                    std::string(netmask_buf),
+                    std::string(broadcast_buf),
+                    std::string(peer_buf),
+                    (ifa->ifa_flags & IFF_LOOPBACK) != 0,
+                    (ifa->ifa_flags & IFF_MULTICAST) != 0
+                };
+
+                iface.ipv4.emplace_back(std::move(addr));
+            } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+                auto sa6 = reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr);
+                if (!inet_ntop(AF_INET6, &(sa6->sin6_addr), addr_buf, sizeof(addr_buf)))
+                    continue;
+
+                if (ifa->ifa_netmask) {
+                    auto netmask6 = reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_netmask);
+                    inet_ntop(AF_INET6, &(netmask6->sin6_addr), netmask_buf, sizeof(netmask_buf));
+                }
+
+                std::string scope_id_str;
+                if (sa6->sin6_scope_id != 0) {
+                    scope_id_str = std::to_string(sa6->sin6_scope_id);
+                }
+
+                local_ip_address_v6 addr6{
+                    std::string(addr_buf),
+                    std::string(netmask_buf),
+                    (ifa->ifa_flags & IFF_LOOPBACK) != 0,
+                    (ifa->ifa_flags & IFF_MULTICAST) != 0,
+                    IN6_IS_ADDR_LINKLOCAL(&sa6->sin6_addr),
+                    std::move(scope_id_str)
+                };
+
+                iface.ipv6.emplace_back(std::move(addr6));
+            }
+        }
+
+        freeifaddrs(ifaddr);
+
+        list.reserve(iface_map.size());
+        for (auto& kv : iface_map) {
+            list.emplace_back(std::move(kv.second));
+        }
+
+        return list;
+    }
+    /**
+     * @brief Check if there is a usable IPv4 address on the system.
+     * @return True if a usable IPv4 address exists, false otherwise.
+     */
+    static bool usable_ipv6_address_exists() {
+        static auto interfaces = ssock::sock::get_interfaces();
+
+        for (const auto& iface : interfaces) {
+            if (!iface.is_up()) continue;
+
+            for (const auto& addr : iface.get_ipv6_addrs()) {
+                const auto& ip = addr.get_ip();
+                if (ip.empty()) continue;
+
+                if (addr.is_loopback() || addr.is_link_local() || addr.is_multicast()) {
+                    continue;
+                }
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+    /**
+     * @brief Resolve a hostname to an IP address.
+     * @param hostname The hostname to resolve.
+     * @param port The port to use (default is 80).
+     * @return A sock_ip_list struct that contains the IPv4 and IPv6 addresses of the hostname.
+     */
     static sock_ip_list resolve_hostname(const std::string& hostname, const int port) {
         addrinfo hints{}, *res;
 
@@ -630,15 +887,29 @@ namespace ssock::sock {
 
         return {std::move(v4), std::move(v6)};
     }
-
+    /**
+     * @brief Check if a string is a valid IPv4 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv4 address, false otherwise.
+     */
     static bool is_ipv4(const std::string& ip) {
         sockaddr_in sa{};
         return inet_pton(AF_INET, ip.c_str(), &(sa.sin_addr)) != 0;
     }
+    /**
+     * @brief Check if a string is a valid IPv6 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv6 address, false otherwise.
+     */
     static bool is_ipv6(const std::string& ip) {
         sockaddr_in6 sa{};
         return inet_pton(AF_INET6, ip.c_str(), &(sa.sin6_addr)) != 0;
     }
+    /**
+     * @brief Check if a port is valid.
+     * @param port The port to check.
+     * @return True if the port is valid, false otherwise.
+     */
     static bool is_valid_port(const int port) {
         return port > 0 && port <= 65535;
     }
