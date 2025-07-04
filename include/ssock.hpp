@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <stdexcept>
+#include <cstring>
 #include <unordered_map>
 
 #ifndef SSOCK
