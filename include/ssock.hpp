@@ -9,6 +9,8 @@
 
 #include <sstream>
 #include <string>
+#include <vector>
+#include <stdexcept>
 #include <unordered_map>
 
 #ifndef SSOCK
