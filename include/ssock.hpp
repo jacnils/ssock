@@ -14,6 +14,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <variant>
+#include <algorithm>
 
 #ifndef SSOCK
 #define SSOCK 1
