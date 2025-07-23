@@ -385,7 +385,7 @@ namespace ssock::network {
              * @param port The port to use (default is 80).
              * @return A sock_ip_list struct that contains the IPv4 and IPv6 addresses of the hostname.
              */
-            sock_ip_list resolve_hostname(const int port) {
+            sock_ip_list resolve_hostname(const int port = 80) {
                 addrinfo hints{}, *res;
 
                 hints.ai_family = AF_UNSPEC;
@@ -436,8 +436,12 @@ namespace ssock::network {
                 u_char response[2048]{};
                 int len = res_query(hostname.c_str(), ns_c_in, qtype, response, sizeof(response));
                 if (len < 0) {
-                    std::string err = "query_records(): res_query failed: " + std::string(hstrerror(h_errno));
-                    throw std::runtime_error(err);
+                    if (h_errno == NO_DATA) {
+                        std::cerr << "No " << ((qtype == ns_t_a) ? "A" : "requested")
+                                  << " record found for: " << hostname << std::endl;
+                        return {};
+                    }
+                    throw std::runtime_error("query_records(): res_query failed: " + std::string(hstrerror(h_errno)));
                 }
 
                 ns_msg handle;

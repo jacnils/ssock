@@ -53,7 +53,95 @@ void test_dns(const std::string& hostname = "google.com") {
         }, rec.data);
         std::cout << "---------------------\n";
     }
+}
 
+void test_dns_steps(const std::string& hostname = "google.com") {
+    ssock::network::dns::dns_resolver resolver(hostname);
+    auto addresses = resolver.resolve_hostname();
+
+    std::cout << "Resolved IPs for " << hostname << ":\n";
+    if (addresses.contains_ipv4()) {
+        std::cout << "IPv4: " << addresses.get_ipv4() << "\n";
+    } else {
+        std::cout << "No IPv4 address found.\n";
+    }
+    if (addresses.contains_ipv6()) {
+        std::cout << "IPv6: " << addresses.get_ipv6() << "\n";
+    } else {
+        std::cout << "No IPv6 address found.\n";
+    }
+
+    // manually query each instead of an ANY query
+    auto a_records = resolver.query_records(ssock::network::dns::dns_record_type::A);
+    auto aaaa_records = resolver.query_records(ssock::network::dns::dns_record_type::AAAA);
+    auto cname_records = resolver.query_records(ssock::network::dns::dns_record_type::CNAME);
+    auto txt_records = resolver.query_records(ssock::network::dns::dns_record_type::TXT);
+    auto mx_records = resolver.query_records(ssock::network::dns::dns_record_type::MX);
+    auto ns_records = resolver.query_records(ssock::network::dns::dns_record_type::NS);
+    std::cout << "\nA Records:\n";
+    for (const auto& rec : a_records) {
+        std::cout << "Name: " << rec.name << "\n";
+        if (std::holds_alternative<ssock::network::dns::a_record_data>(rec.data)) {
+            auto data = std::get<ssock::network::dns::a_record_data>(rec.data);
+            std::cout << "Type: A Record\n";
+            std::cout << "Value: " << data.ip.get_ipv4() << "\n";
+        }
+        std::cout << "---------------------\n";
+    }
+    std::cout << "\nAAAA Records:\n";
+    for (const auto& rec : aaaa_records) {
+        std::cout << "Name: " << rec.name << "\n";
+        if (std::holds_alternative<ssock::network::dns::aaaa_record_data>(rec.data)) {
+            auto data = std::get<ssock::network::dns::aaaa_record_data>(rec.data);
+            std::cout << "Type: AAAA Record\n";
+            std::cout << "Value: " << data.ip.get_ipv6() << "\n";
+        }
+        std::cout << "---------------------\n";
+    }
+    std::cout << "\nCNAME Records:\n";
+    for (const auto& rec : cname_records) {
+        std::cout << "Name: " << rec.name << "\n";
+        if (std::holds_alternative<ssock::network::dns::cname_record_data>(rec.data)) {
+            auto data = std::get<ssock::network::dns::cname_record_data>(rec.data);
+            std::cout << "Type: CNAME Record\n";
+            std::cout << "Value: " << data.cname << "\n";
+        }
+        std::cout << "---------------------\n";
+    }
+    std::cout << "\nTXT Records:\n";
+    for (const auto& rec : txt_records) {
+        std::cout << "Name: " << rec.name << "\n";
+        if (std::holds_alternative<ssock::network::dns::txt_record_data>(rec.data)) {
+            auto data = std::get<ssock::network::dns::txt_record_data>(rec.data);
+            std::cout << "Type: TXT Record\n";
+            for (const auto& text : data.text) {
+                std::cout << "Value: " << text << "\n";
+            }
+        }
+        std::cout << "---------------------\n";
+    }
+    std::cout << "\nMX Records:\n";
+    for (const auto& rec : mx_records) {
+        std::cout << "Name: " << rec.name << "\n";
+        if (std::holds_alternative<ssock::network::dns::mx_record_data>(rec.data)) {
+            auto data = std::get<ssock::network::dns::mx_record_data>(rec.data);
+            std::cout << "Type: MX Record\n";
+            std::cout << "Preference: " << data.preference << "\n";
+            std::cout << "Exchange: " << data.exchange << "\n";
+        }
+        std::cout << "---------------------\n";
+    }
+    std::cout << "\nNS Records:\n";
+    for (const auto& rec : ns_records) {
+        std::cout << "Name: " << rec.name << "\n";
+        if (std::holds_alternative<ssock::network::dns::ns_record_data>(rec.data)) {
+            auto data = std::get<ssock::network::dns::ns_record_data>(rec.data);
+            std::cout << "Type: NS Record\n";
+            std::cout << "NS: " << data.ns << "\n";
+        }
+        std::cout << "---------------------\n";
+    }
+    std::cout << "\n";
 }
 
 int main() {
@@ -62,4 +150,7 @@ int main() {
     test_dns("google.com");
     test_dns("forwarderfactory.com");
     test_dns("jacobnilsson.com");
+    test_dns_steps("google.com");
+    test_dns_steps("forwarderfactory.com");
+    test_dns_steps("jacobnilsson.com");
 }
