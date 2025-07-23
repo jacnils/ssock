@@ -46,4 +46,7 @@ install(TARGETS ssock
 )
 
 add_executable(ssock-build-test test_header.cpp)
+target_link_libraries(ssock-build-test
+        resolv
+)
 include_directories(include)

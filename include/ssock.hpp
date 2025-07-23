@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <unordered_map>
+#include <variant>
 
 #ifndef SSOCK
 #define SSOCK 1
@@ -25,6 +26,8 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <arpa/nameser.h>
+#include <resolv.h>
 #include <unistd.h>
 #else
 #error "Unsupported platform. Please file a pull request to add support for your platform."
@@ -50,6 +53,62 @@ namespace ssock::internal_net {
  * @note Contains network-related classes and functions.
  */
 namespace ssock::network {
+    namespace dns {
+        class dns_resolver;
+    };
+
+    /**
+     * @brief Socket address types.
+     * @note Use ipv4/ipv6 for IP addresses, and hostname_ipv4/hostname_ipv6 for hostnames, depending on the address type.
+     * @note If you are unsure but have a hostname, use hostname_ipv4.
+     */
+    enum class sock_addr_type {
+        ipv4 = 0, /* IPv4 address */
+        ipv6 = 1, /* IPv6 address */
+        hostname_ipv4 = 2, /* Hostname; resolve to IPv4 address */
+        hostname_ipv6 = 3, /* Hostname; resolve to IPv6 address */
+        hostname = 4, /* Hostname; resolve to IPv4 address */
+    };
+
+    /**
+     * @brief A struct that contains the IPv4 and IPv6 addresses of a hostname.
+     * @note Use resolve_hostname() to get the addresses.
+     */
+    class sock_ip_list final {
+    protected:
+        std::string v4{};
+        std::string v6{};
+        friend class sync_sock;
+        friend class dns::dns_resolver;
+    public:
+        explicit sock_ip_list() = default;
+        sock_ip_list(std::string v4, std::string v6) : v4(std::move(v4)), v6(std::move(v6)) {}
+        [[nodiscard]] bool contains_ipv4() const noexcept {
+            return !v4.empty();
+        }
+        [[nodiscard]] bool contains_ipv6() const noexcept {
+            return !v6.empty();
+        }
+        [[nodiscard]] std::string get_ipv4() const {
+            if (!this->contains_ipv4()) {
+                throw std::runtime_error("sock_ip_list(): no IPv4 address");
+            }
+            return v4;
+        }
+        [[nodiscard]] std::string get_ipv6() const {
+            if (!this->contains_ipv6()) {
+                throw std::runtime_error("sock_ip_list(): no IPv6 address");
+            }
+            return v6;
+        }
+        [[nodiscard]] std::string get_ip() const {
+            if (v4.empty() && v6.empty()) {
+                throw std::runtime_error("sock_ip_list(): no IP address");
+            }
+            return v6.empty() ? v4 : v6;
+        }
+    };
+
     class local_ip_address_v4 final {
     protected:
         std::string ip{};
@@ -153,6 +212,309 @@ namespace ssock::network {
             return point_to_point;
         }
     };
+    namespace dns {
+        enum class dns_record_type {
+            A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, PTR, CAA, OTHER
+        };
+
+        struct generic_record_data {
+            uint16_t type;
+            std::vector<uint8_t> raw;
+        };
+
+        struct a_record_data {
+            sock_ip_list ip;
+        };
+
+        struct aaaa_record_data {
+            sock_ip_list ip;
+        };
+
+        struct cname_record_data {
+            std::string cname;
+        };
+
+        struct mx_record_data {
+            uint16_t preference;
+            std::string exchange;
+        };
+
+        struct ns_record_data {
+            std::string ns;
+        };
+
+        struct txt_record_data {
+            std::vector<std::string> text;
+        };
+
+        struct soa_record_data {
+            std::string mname;
+            std::string rname;
+            uint32_t serial, refresh, retry, expire, minimum;
+        };
+
+        struct srv_record_data {
+            uint16_t priority, weight, port;
+            std::string target;
+        };
+
+        struct ptr_record_data {
+            std::string ptrname;
+        };
+
+        struct caa_record_data {
+            uint8_t flags;
+            std::string tag;
+            std::string value;
+        };
+
+        using dns_record_data = std::variant<
+            a_record_data,
+            aaaa_record_data,
+            cname_record_data,
+            mx_record_data,
+            ns_record_data,
+            txt_record_data,
+            soa_record_data,
+            srv_record_data,
+            ptr_record_data,
+            caa_record_data,
+            generic_record_data,
+            std::monostate
+        >;
+
+        struct dns_record {
+            std::string name;
+            dns_record_type type{};
+            uint16_t record_class = 1;
+            uint32_t ttl{};
+            dns_record_data data;
+        };
+
+        using dns_selector = std::variant<std::monostate, std::string, dns_record_type>;
+        class dns_resolver final {
+            std::string hostname{};
+
+            void throw_if_invalid() {
+                if (hostname.empty()) {
+                    throw std::runtime_error("dns_resolver(): hostname cannot be empty");
+                }
+                if (hostname.find('.') == std::string::npos) {
+                    throw std::runtime_error("dns_resolver(): hostname must contain at least one dot (.)");
+                }
+                if (hostname.back() == '.') {
+                    throw std::runtime_error("dns_resolver(): hostname cannot end with a dot (.)");
+                }
+            }
+
+            template<typename>
+            struct always_false : std::false_type {};
+
+            static int dns_type_from_string(const std::string& type_str) {
+                static const std::unordered_map<std::string, int> type_map = {
+                    {"A", ns_t_a},
+                    {"AAAA", ns_t_aaaa},
+                    {"CNAME", ns_t_cname},
+                    {"MX", ns_t_mx},
+                    {"NS", ns_t_ns},
+                    {"TXT", ns_t_txt},
+                    {"SOA", ns_t_soa},
+                    {"SRV", ns_t_srv},
+                    {"PTR", ns_t_ptr},
+                    {"CAA", 257},
+                    {"ANY", ns_t_any}
+                };
+
+                std::string key = type_str;
+                std::transform(key.begin(), key.end(), key.begin(), ::toupper); // normalize
+
+                auto it = type_map.find(key);
+                if (it != type_map.end()) return it->second;
+
+                throw std::invalid_argument("dns_type_from_string(): unknown DNS type: " + type_str);
+            }
+
+            static int resolve_query_type(const dns_selector& selector) {
+                return std::visit([](auto&& arg) -> int {
+                    using T = std::decay_t<decltype(arg)>;
+                    if constexpr (std::is_same_v<T, std::monostate>) return ns_t_any;
+                    else if constexpr (std::is_same_v<T, std::string>) return dns_type_from_string(arg);
+                    else if constexpr (std::is_same_v<T, dns_record_type>) {
+                        switch (arg) {
+                            case dns_record_type::A: return ns_t_a;
+                            case dns_record_type::AAAA: return ns_t_aaaa;
+                            case dns_record_type::CNAME: return ns_t_cname;
+                            case dns_record_type::MX: return ns_t_mx;
+                            case dns_record_type::NS: return ns_t_ns;
+                            case dns_record_type::TXT: return ns_t_txt;
+                            case dns_record_type::SOA: return ns_t_soa;
+                            case dns_record_type::SRV: return ns_t_srv;
+                            case dns_record_type::PTR: return ns_t_ptr;
+                            case dns_record_type::CAA: return 257;
+                            default: return ns_t_any;
+                        }
+                    } else {
+                        static_assert(always_false<T>::value, "unhandled selector type");
+                    }
+                }, selector);
+                throw std::runtime_error("dns_resolver(): invalid selector type");
+            }
+        public:
+            dns_resolver() = default;
+            explicit dns_resolver(std::string hostname) : hostname(std::move(hostname)) {
+                throw_if_invalid();
+            }
+            /**
+             * @brief Set the hostname to resolve.
+             * @param hostname The hostname to resolve.
+             */
+            void set_hostname(const std::string& hostname) {
+                this->hostname = hostname;
+                throw_if_invalid();
+            }
+            /**
+             * @brief Get the hostname to resolve.
+             * @return The hostname to resolve.
+             */
+            [[nodiscard]] std::string get_hostname() const {
+                return this->hostname;
+            }
+            /**
+             * @brief Resolve the hostname to an IP address.
+             * @param port The port to use (default is 80).
+             * @return A sock_ip_list struct that contains the IPv4 and IPv6 addresses of the hostname.
+             */
+            sock_ip_list resolve_hostname(const int port) {
+                addrinfo hints{}, *res;
+
+                hints.ai_family = AF_UNSPEC;
+                hints.ai_socktype = SOCK_STREAM;
+
+                int status = getaddrinfo(this->hostname.c_str(), std::to_string(port).c_str(), &hints, &res);
+                if (status != 0) {
+                    throw std::runtime_error("resolve_hostname(): function getaddrinfo returned: " + std::string(gai_strerror(status)));
+                }
+
+                std::string v4{};
+                std::string v6{};
+
+                for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+                    char ipstr[INET6_ADDRSTRLEN];
+
+                    void* addr{};
+                    if (p->ai_family == AF_INET) {
+                        auto* ipv4 = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+                        addr = &(ipv4->sin_addr);
+                    } else if (p->ai_family == AF_INET6) {
+                        auto* ipv6 = reinterpret_cast<sockaddr_in6*>(p->ai_addr);
+                        addr = &(ipv6->sin6_addr);
+                    } else {
+                        freeaddrinfo(res);
+                        throw std::runtime_error("unknown address family");
+                    }
+
+                    inet_ntop(p->ai_family, addr, ipstr, sizeof(ipstr));
+                    if (p->ai_family == AF_INET) {
+                        v4 = ipstr;
+                    } else if (p->ai_family == AF_INET6) {
+                        v6 = ipstr;
+                    }
+                }
+
+                freeaddrinfo(res);
+
+                return {std::move(v4), std::move(v6)};
+            }
+            std::vector<dns_record> query_records(const dns_selector& selector = std::monostate{}) {
+                throw_if_invalid();
+
+                int qtype = resolve_query_type(selector);
+
+                res_init();
+
+                u_char response[2048]{};
+                int len = res_query(hostname.c_str(), ns_c_in, qtype, response, sizeof(response));
+                if (len < 0) {
+                    std::string err = "query_records(): res_query failed: " + std::string(hstrerror(h_errno));
+                    throw std::runtime_error(err);
+                }
+
+                ns_msg handle;
+                if (len != 0) {
+                    if (ns_initparse(response, len, &handle) < 0) {
+                        std::string error = "query_records(): DNS response parse failed with error: " + std::string(hstrerror(h_errno));
+                        error += ", length: " + std::to_string(len);
+                        throw std::runtime_error(error);
+                    }
+                }
+
+                std::vector<dns_record> records;
+                int count = ns_msg_count(handle, ns_s_an);
+
+                for (int i = 0; i < count; ++i) {
+                    ns_rr rr;
+                    if (ns_parserr(&handle, ns_s_an, i, &rr) != 0) continue;
+
+                    const u_char* rdata = ns_rr_rdata(rr);
+                    uint16_t type = ns_rr_type(rr);
+                    uint16_t rdlen = ns_rr_rdlen(rr);
+
+                    dns_record rec;
+                    rec.name = ns_rr_name(rr);
+                    rec.ttl = ns_rr_ttl(rr);
+                    rec.type = dns_record_type::OTHER;
+
+                    switch (type) {
+                        case ns_t_a: {
+                            char ip[INET_ADDRSTRLEN];
+                            inet_ntop(AF_INET, rdata, ip, sizeof(ip));
+                            rec.type = dns_record_type::A;
+                            auto list = sock_ip_list{ip, ""};
+                            rec.data = a_record_data{list};
+                            break;
+                        }
+                        case ns_t_aaaa: {
+                            char ip[INET6_ADDRSTRLEN];
+                            inet_ntop(AF_INET6, rdata, ip, sizeof(ip));
+                            rec.type = dns_record_type::AAAA;
+                            auto list = sock_ip_list{"", ip};
+                            rec.data = aaaa_record_data{list};
+                            break;
+                        }
+                        case ns_t_cname: {
+                            char cname[NS_MAXDNAME];
+                            ns_name_uncompress(response, response + len, rdata, cname, sizeof(cname));
+                            rec.type = dns_record_type::CNAME;
+                            rec.data = cname_record_data{cname};
+                            break;
+                        }
+                        case ns_t_txt: {
+                            txt_record_data txt;
+                            int offset = 0;
+                            while (offset < rdlen) {
+                                uint8_t slen = rdata[offset];
+                                txt.text.emplace_back((const char*)&rdata[offset + 1], slen);
+                                offset += slen + 1;
+                            }
+                            rec.type = dns_record_type::TXT;
+                            rec.data = txt;
+                            break;
+                        }
+                        default: {
+                            std::vector<uint8_t> raw(rdata, rdata + rdlen);
+                            rec.data = generic_record_data{type, raw};
+                            break;
+                        }
+                    }
+
+                    records.push_back(std::move(rec));
+                }
+
+                return records;
+            }
+
+        };
+    }
 
     /**
      * @brief A function that gets the local network interfaces.
@@ -300,18 +662,7 @@ namespace ssock::sock {
      * @note This is a typedef for int, but can be changed to a different type if needed.
      */
     using sock_fd_t = int;
-    /**
-     * @brief Socket address types.
-     * @note Use ipv4/ipv6 for IP addresses, and hostname_ipv4/hostname_ipv6 for hostnames, depending on the address type.
-     * @note If you are unsure but have a hostname, use hostname_ipv4.
-     */
-    enum class sock_addr_type {
-        ipv4 = 0, /* IPv4 address */
-        ipv6 = 1, /* IPv6 address */
-        hostname_ipv4 = 2, /* Hostname; resolve to IPv4 address */
-        hostname_ipv6 = 3, /* Hostname; resolve to IPv6 address */
-        hostname = 4, /* Hostname; resolve to IPv4 address */
-    };
+    using sock_addr_type = network::sock_addr_type;
 
     /**
      * @brief Socket types.
@@ -321,43 +672,7 @@ namespace ssock::sock {
         udp, /* UDP socket */
     };
 
-    /**
-     * @brief A struct that contains the IPv4 and IPv6 addresses of a hostname.
-     * @note Use resolve_hostname() to get the addresses.
-     */
-    class sock_ip_list final {
-    protected:
-        std::string v4{};
-        std::string v6{};
-        friend class sync_sock;
-    public:
-        explicit sock_ip_list() = default;
-        sock_ip_list(std::string v4, std::string v6) : v4(std::move(v4)), v6(std::move(v6)) {}
-        [[nodiscard]] bool contains_ipv4() const noexcept {
-            return !v4.empty();
-        }
-        [[nodiscard]] bool contains_ipv6() const noexcept {
-            return !v6.empty();
-        }
-        [[nodiscard]] std::string get_ipv4() const {
-            if (!this->contains_ipv4()) {
-                throw std::runtime_error("sock_ip_list(): no IPv4 address");
-            }
-            return v4;
-        }
-        [[nodiscard]] std::string get_ipv6() const {
-            if (!this->contains_ipv6()) {
-                throw std::runtime_error("sock_ip_list(): no IPv6 address");
-            }
-            return v6;
-        }
-        [[nodiscard]] std::string get_ip() const {
-            if (v4.empty() && v6.empty()) {
-                throw std::runtime_error("sock_ip_list(): no IP address");
-            }
-            return v6.empty() ? v4 : v6;
-        }
-    };
+    using sock_ip_list = network::sock_ip_list;
 
     /**
      * @brief A class that represents a socket handle.
@@ -384,13 +699,6 @@ namespace ssock::sock {
         }
     };
 
-    /**
-     * @brief A function that resolves a hostname to an IP address.
-     * @param hostname The hostname to resolve.
-     * @param port The port to use (default is 80).
-     * @return A sock_ip_list struct that contains the IPv4 and IPv6 addresses of the hostname.
-     */
-    static sock_ip_list resolve_hostname(const std::string& hostname, int port = 80);
     /**
      * @brief A function that checks if a string is a valid IPv4 address.
      * @param ip The string to check.
@@ -430,7 +738,9 @@ namespace ssock::sock {
         sock_addr(const std::string& hostname, int port, sock_addr_type t) : hostname(hostname), port(port), type(t) {
             const auto resolve_host = [](const std::string& h, int p, bool t) -> std::string {
                 try {
-                    return t ? resolve_hostname(h, p).get_ipv6() : resolve_hostname(h, p).get_ipv4();
+                    network::dns::dns_resolver resolver(h);
+                    auto ip_list = resolver.resolve_hostname(p);
+                    return t ? ip_list.get_ipv6() : ip_list.get_ipv4();
                 } catch (const std::exception&) {
                     return {};
                 }

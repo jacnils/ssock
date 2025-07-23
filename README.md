@@ -19,10 +19,14 @@ polished this up and released it as a standalone library for Unix.
 - (Basic) HTTP body parser, including headers and body.
 - IPv4 and IPv6 support
 - TCP and UDP support
+- DNS resolution*
 - Network interface enumeration
 - Exceptions for errors
 - Inheritable classes for easy extension
 - C++23
+- No dependencies*
+
+*DNS resolution requires resolv, and you may need to link against it on some systems.
 
 Still missing:
 
