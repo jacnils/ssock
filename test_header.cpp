@@ -1,4 +1,8 @@
 #include <iostream>
+#include <vector>
+#include <string>
+#include <thread>
+#include <fstream>
 #include <ssock.hpp>
 
 void test_socket() {
@@ -144,6 +148,49 @@ void test_dns_steps(const std::string& hostname = "google.com") {
     std::cout << "\n";
 }
 
+void test_http_server() {
+    ssock::sock::sock_addr addr = {"127.0.0.1", 8080, ssock::sock::sock_addr_type::ipv4};
+    ssock::sock::sync_sock sock{addr, ssock::sock::sock_type::tcp, ssock::sock::sock_opt::reuse_addr};
+
+    // bind the socket
+    sock.bind();
+    sock.listen(-1);
+
+    while (true) {
+        // accept a new connection
+        auto client_sock = sock.accept();
+        std::cout << "New connection accepted." << std::endl;
+        try {
+            // receive data from the client
+            std::string request = client_sock->recv(-1, "\r\n\r\n");
+            std::cout << "Received request:\n" << request << std::endl;
+
+            // send a simple HTTP response
+            std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nHello, World client " + // random identifier
+                                   std::to_string(rand() % 1000) + "!\r\n\r\n";
+            client_sock->send(response);
+            client_sock->close();
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+        }
+    }
+}
+
+void test_http_abstr() {
+    ssock::http::client client{"127.0.0.1", "/", 8080, ssock::http::method::GET, ssock::http::version::HTTP_1_1};
+    client.set_body("<html><body>Hello, World!</body></html>");
+    client.set_header("Content-Type", "text/html");
+    client.set_header("User-Agent", "ssock-test/1.0");
+    client.set_connection("close");
+    client.append_headers({{"X-Test-Header", "TestValue"}});
+    auto response = client.get();
+    std::cout << "HTTP headers:\n";
+    for (const auto& header : response.headers) {
+        std::cout << header.first << ": " << header.second << std::endl;
+    }
+    std::cout << "HTTP body:\n" << response.body << std::endl;
+}
+
 int main() {
     std::cout << "ssock.hpp" << std::endl;
     test_socket();
@@ -153,4 +200,18 @@ int main() {
     test_dns_steps("google.com");
     test_dns_steps("forwarderfactory.com");
     test_dns_steps("jacobnilsson.com");
+
+    std::thread server_thread([]() {
+        try {
+            test_http_server();
+        } catch (const std::exception& e) {
+            std::cerr << "HTTP Server Error: " << e.what() << std::endl;
+        }
+    });
+    server_thread.detach();
+    std::this_thread::sleep_for(std::chrono::seconds(2)); // give the server time to start
+
+    test_http_abstr();
+
+    return EXIT_SUCCESS;
 }

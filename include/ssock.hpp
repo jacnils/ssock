@@ -46,6 +46,7 @@ namespace ssock::internal_net {
     static constexpr auto sys_net_bind = bind;
     static constexpr auto sys_net_accept = accept;
     static constexpr auto sys_net_select = select;
+    static constexpr auto sys_net_setsockopt = setsockopt;
 #endif
 }
 
@@ -296,7 +297,7 @@ namespace ssock::network {
         class dns_resolver final {
             std::string hostname{};
 
-            void throw_if_invalid() {
+            void throw_if_invalid() const {
                 if (hostname.empty()) {
                     throw std::runtime_error("dns_resolver(): hostname cannot be empty");
                 }
@@ -327,7 +328,7 @@ namespace ssock::network {
                 };
 
                 std::string key = type_str;
-                std::transform(key.begin(), key.end(), key.begin(), ::toupper); // normalize
+                std::ranges::transform(key.begin(), key.end(), key.begin(), ::toupper); // normalize
 
                 auto it = type_map.find(key);
                 if (it != type_map.end()) return it->second;
@@ -336,8 +337,8 @@ namespace ssock::network {
             }
 
             static int resolve_query_type(const dns_selector& selector) {
-                return std::visit([](auto&& arg) -> int {
-                    using T = std::decay_t<decltype(arg)>;
+                return std::visit([]<typename T0>(T0&& arg) -> int {
+                    using T = std::decay_t<T0>;
                     if constexpr (std::is_same_v<T, std::monostate>) return ns_t_any;
                     else if constexpr (std::is_same_v<T, std::string>) return dns_type_from_string(arg);
                     else if constexpr (std::is_same_v<T, dns_record_type>) {
@@ -357,8 +358,8 @@ namespace ssock::network {
                     } else {
                         static_assert(always_false<T>::value, "unhandled selector type");
                     }
+                    throw std::invalid_argument("resolve_query_type(): unhandled selector type");
                 }, selector);
-                throw std::runtime_error("dns_resolver(): invalid selector type");
             }
         public:
             dns_resolver() = default;
@@ -385,7 +386,7 @@ namespace ssock::network {
              * @param port The port to use (default is 80).
              * @return A sock_ip_list struct that contains the IPv4 and IPv6 addresses of the hostname.
              */
-            sock_ip_list resolve_hostname(const int port = 80) {
+            [[nodiscard]] sock_ip_list resolve_hostname(const int port = 80) const {
                 addrinfo hints{}, *res;
 
                 hints.ai_family = AF_UNSPEC;
@@ -426,7 +427,7 @@ namespace ssock::network {
 
                 return {std::move(v4), std::move(v6)};
             }
-            std::vector<dns_record> query_records(const dns_selector& selector = std::monostate{}) {
+            [[nodiscard]] std::vector<dns_record> query_records(const dns_selector& selector = std::monostate{}) const {
                 throw_if_invalid();
 
                 int qtype = resolve_query_type(selector);
@@ -626,8 +627,8 @@ namespace ssock::network {
         freeifaddrs(ifaddr);
 
         list.reserve(iface_map.size());
-        for (auto& kv : iface_map) {
-            list.emplace_back(std::move(kv.second));
+        for (auto&[fst, snd] : iface_map) {
+            list.emplace_back(std::move(snd));
         }
 
         return list;
@@ -662,6 +663,9 @@ namespace ssock::network {
  * @brief Namespace for the ssock library.
  */
 namespace ssock::sock {
+    class sync_sock;
+    class sock_addr;
+
     /**
      * @brief Socket file descriptor type.
      * @note This is a typedef for int, but can be changed to a different type if needed.
@@ -676,33 +680,25 @@ namespace ssock::sock {
         tcp, /* TCP socket */
         udp, /* UDP socket */
     };
+    /**
+     * @brief Socket options.
+     * @note These options can be used with the sync_sock class to set socket options.
+     */
+    enum class sock_opt {
+        reuse_addr = 1 << 0, /* Reuse address option */
+        no_reuse_addr = 1 << 1, /* Do not reuse address option */
+    };
+    inline sock_opt operator|(sock_opt lhs, sock_opt rhs) {
+        using T = std::underlying_type_t<sock_opt>;
+        return static_cast<sock_opt>(static_cast<T>(lhs) | static_cast<T>(rhs));
+    }
+
+    inline bool operator&(sock_opt lhs, sock_opt rhs) {
+        using T = std::underlying_type_t<sock_opt>;
+        return static_cast<T>(lhs) & static_cast<T>(rhs);
+    }
 
     using sock_ip_list = network::sock_ip_list;
-
-    /**
-     * @brief A class that represents a socket handle.
-     * @note This class is used internally by the sync_sock class.
-     * @note Only useful for binding and accepting connections.
-     */
-    class sock_handle final {
-        sock_fd_t sfd{};
-        bool valid{false};
-        friend class sync_sock;
-    public:
-        sock_handle() = default;
-        /**
-         * @brief Returns true if the socket handle is valid.
-         * @return True if the socket handle is valid, false otherwise.
-         */
-        [[nodiscard]] bool is_valid() const noexcept {
-            return valid;
-        }
-        ~sock_handle() {
-            if (valid) {
-                internal_net::sys_net_close(sfd);
-            }
-        }
-    };
 
     /**
      * @brief A function that checks if a string is a valid IPv4 address.
@@ -722,6 +718,13 @@ namespace ssock::sock {
      * @return True if the port is valid, false otherwise.
      */
     static bool is_valid_port(int port);
+
+    /**
+     * @brief Get the peer address of a socket.
+     * @param sockfd The socket file descriptor.
+     * @return A sock_addr object that contains the peer address of the socket.
+     */
+    static sock_addr get_peer(int sockfd);
     /**
      * @brief A class that represents a socket address.
      * @param hostname The hostname or IP address to resolve.
@@ -733,6 +736,9 @@ namespace ssock::sock {
         std::string ip{};
         int port{};
         sock_addr_type type{sock_addr_type::hostname};
+        friend sock_addr get_peer(int);
+
+        sock_addr() = default;
     public:
         /**
          * @brief Constructs a sock_addr object.
@@ -859,28 +865,22 @@ namespace ssock::sock {
         virtual ~basic_sync_sock() = default;
         basic_sync_sock(const basic_sync_sock&) = delete;
 
-        virtual void connect() const = 0;
+        virtual void connect() = 0;
         virtual void bind() = 0;
         virtual void unbind() = 0;
-        virtual void listen(int backlog) const = 0;
-        virtual sock_handle accept() = 0;
-        virtual int send(const void* buf, size_t len, const sock_handle& h) const = 0;
-        virtual int send(const void* buf, size_t len) const = 0;
-        virtual void send(const std::string& buf, const sock_handle& h) const = 0;
-        virtual void send(const std::string& buf) const = 0;
-        [[nodiscard]] virtual std::string recv(int timeout_seconds, const sock_handle& h) const = 0;
-        [[nodiscard]] virtual std::string recv_line(const sock_handle& h) const = 0;
+        virtual void listen(int backlog) = 0;
+        virtual std::unique_ptr<sync_sock> accept() = 0;
+        virtual int send(const void* buf, size_t len) = 0;
+        virtual void send(const std::string& buf) = 0;
         [[nodiscard]] virtual std::string recv(int timeout_seconds) const = 0;
-        [[nodiscard]] virtual std::string recv() const = 0;
-        [[nodiscard]] virtual std::string recv_line() const = 0;
-        virtual void close(const sock_handle& handle) const = 0;
-        virtual void close() const = 0;
+        [[nodiscard]] virtual std::string recv(int timeout_seconds, const std::string& match) const = 0;
+        virtual void close() = 0;
     };
 
     /**
      * @brief A class that represents a synchronous socket.
      */
-    class sync_sock final : basic_sync_sock {
+    class sync_sock : basic_sync_sock {
         sock_addr addr;
         sock_type type{};
         int sockfd{};
@@ -923,8 +923,9 @@ namespace ssock::sock {
          * @brief Constructs a sync_sock object.
          * @param addr The socket address to bind to.
          * @param t The socket type (tcp or udp).
+         * @param opts The socket options (reuse_addr, no_reuse_addr).
          */
-        sync_sock(const sock_addr& addr, sock_type t) : addr(addr), type(t) {
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr) : addr(addr), type(t) {
             if (addr.get_ip().empty()) {
                 throw std::runtime_error("IP address is empty");
             }
@@ -936,8 +937,15 @@ namespace ssock::sock {
                 throw std::runtime_error("failed to create socket");
             }
 
+            if (opts & sock_opt::reuse_addr) {
+                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opts, sizeof(opts));
+            } else if (opts & sock_opt::no_reuse_addr) {
+                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, nullptr, 0);
+            }
+
             this->prep_sa();
         }
+
         ~sync_sock() override {
             internal_net::sys_net_close(sockfd);
         }
@@ -958,7 +966,7 @@ namespace ssock::sock {
         /**
          * @brief Connect the socket to the server.
          */
-        void connect() const override {
+        void connect() override {
             if (internal_net::sys_net_connect(this->sockfd, this->get_sa(), this->get_sa_len()) < 0) {
                 throw std::runtime_error("failed to connect to server");
             }
@@ -1007,7 +1015,7 @@ namespace ssock::sock {
          * @param backlog The maximum number of pending connections (default is 5).
          * @note Very barebones, use with care.
          */
-        void listen(int backlog) const override {
+        void listen(int backlog) override {
             if (internal_net::sys_net_listen(this->sockfd, backlog) < 0) {
                 throw std::runtime_error("failed to listen on socket");
             }
@@ -1016,22 +1024,18 @@ namespace ssock::sock {
          * @brief Accept a connection from a client.
          * @return sock_handle The socket handle for the accepted connection.
          */
-        [[nodiscard]] sock_handle accept() override {
+        [[nodiscard]] std::unique_ptr<sync_sock> accept() override {
             sockaddr_storage client_addr{};
             socklen_t addr_len = sizeof(client_addr);
 
             int client_sockfd = internal_net::sys_net_accept(this->sockfd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
             if (client_sockfd < 0) {
-                throw std::runtime_error("failed to accept connection");
+                throw std::runtime_error("failed to accept connection: " + std::string(strerror(errno)));
             }
 
-            sock_handle handle;
-            handle.sfd = client_sockfd;
-            handle.valid = true;
-
-            if (bound) {
-                this->sockfd = client_sockfd;
-            }
+            auto peer = sock::get_peer(client_sockfd);
+            auto handle = std::make_unique<sync_sock>(peer, this->type);
+            handle->sockfd = client_sockfd;
 
             return handle;
         }
@@ -1039,131 +1043,103 @@ namespace ssock::sock {
          * @brief Send data to the server.
          * @param buf The data to send.
          * @param len The length of the data.
-         * @param h The socket handle to use.
          * @return The number of bytes sent.
          */
-        int send(const void* buf, size_t len, const sock_handle& h) const override {
-            std::size_t ret = internal_net::sys_net_send((bound && h.is_valid()) ? h.sfd : this->sockfd, buf, len, 0);
+        int send(const void* buf, size_t len) override {
+            std::size_t ret = internal_net::sys_net_send(this->sockfd, buf, len, 0);
             return static_cast<int>(ret);
         }
         /**
-         * @brief Send data to the server.
-         * @param buf The data to send.
-         * @param len The length of the data.
-         * @return The number of bytes sent.
-         */
-        int send(const void* buf, size_t len) const override {
-            return this->send(buf, len, {});
-        }
-        /**
-         * @brief Send a string to the server.
-         * @param buf The string to send.
-         * @param h The socket handle to use (default is the current socket).
-         */
-        void send(const std::string& buf, const sock_handle& h) const override {
-            static_cast<void>(this->send(buf.c_str(), buf.length(), h));
-        }
-        /**
          * @brief Send a string to the server.
          * @param buf The string to send.
          */
-        void send(const std::string& buf) const override {
-            this->send(buf, {});
+        void send(const std::string& buf) override {
+            static_cast<void>(this->send(buf.c_str(), buf.length()));
         }
         /**
          * @brief Receive data from the server.
          * @param timeout_seconds The timeout in seconds (default is -1, which means no timeout).
-         * @param h The socket handle to use (default is the current socket).
          * @return The received data as a string.
          */
-        [[nodiscard]] std::string recv(const int timeout_seconds, const sock_handle& h) const override {
+        /**
+         * @brief Receive data from the server.
+         * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely until match is found).
+         * @param match The substring to look for in received data.
+         * @return The received data as a string.
+         */
+        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
             std::string data;
+            auto start = std::chrono::steady_clock::now();
 
             while (true) {
                 fd_set readfds;
                 FD_ZERO(&readfds);
-                FD_SET((bound && h.is_valid()) ? h.sfd : this->sockfd, &readfds);
+                FD_SET(this->sockfd, &readfds);
 
                 timeval tv{};
                 timeval* tv_ptr = nullptr;
 
                 if (timeout_seconds >= 0) {
-                    tv.tv_sec = timeout_seconds;
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
+                    auto remaining = timeout_seconds - elapsed;
+                    if (remaining <= 0) {
+                        break;
+                    }
+                    tv.tv_sec = remaining;
                     tv.tv_usec = 0;
                     tv_ptr = &tv;
                 }
 
-                int ret = internal_net::sys_net_select((bound && h.is_valid()) ? h.sfd : this->sockfd + 1, &readfds, nullptr, nullptr, tv_ptr);
+                int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr, tv_ptr);
 
                 if (ret < 0) {
                     throw std::runtime_error("select() failed");
                 }
                 if (ret == 0) {
-                    break;
+                    continue;
                 }
+
                 if (FD_ISSET(this->sockfd, &readfds)) {
                     char buf[1024];
-                    std::size_t received = internal_net::sys_net_recv((bound && h.is_valid()) ? h.sfd : this->sockfd, buf, sizeof(buf), 0);
+                    std::size_t received = internal_net::sys_net_recv(this->sockfd, buf, sizeof(buf), 0);
                     if (received == 0) {
                         break;
                     }
                     data.append(buf, received);
+
+                    if (data.find_last_of(match) != std::string::npos && !match.empty()) {
+                        break;
+                    }
                 }
             }
 
             return data;
         }
-        /**
-         * @brief Receive data from the server.
-         * @param timeout_seconds The timeout in seconds (default is -1, which means no timeout).
+        /* @brief Receive data from the server.
+         * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
          * @return The received data as a string.
          */
         [[nodiscard]] std::string recv(const int timeout_seconds) const override {
-            return this->recv(timeout_seconds, {});
+            return recv(timeout_seconds, "");
         }
-        /**
-         * @brief Receive data from the server.
-         * @return The received data as a string.
-         */
-        [[nodiscard]] std::string recv() const override {
-            return this->recv(-1, {});
-        }
-        /**
-         * @brief Receive a line of data from the server.
-         * @param h The socket handle to use (default is the current socket).
-         * @return The received line as a string.
-         */
-        [[nodiscard]] std::string recv_line(const sock_handle& h) const override {
-            std::string line;
-            char c;
-            while (true) {
-                std::size_t ret = internal_net::sys_net_recv((bound && h.is_valid()) ? h.sfd : this->sockfd, &c, 1, 0);
-                if (ret == 0 || c == '\n') {
-                    break;
-                }
-                line += c;
-            }
-            return line;
-        }
-        [[nodiscard]] std::string recv_line() const override {
-            return this->recv_line({});
-        }
+
         /**
          * @brief Close the socket.
-         * @param handle The socket handle to close (default is the current socket).
          */
-        void close(const sock_handle& handle) const override {
-            if (internal_net::sys_net_close((bound && handle.is_valid()) ? handle.sfd : this->sockfd) < 0) {
+        void close() override {
+            if (!this->sockfd) {
+                throw std::runtime_error("socket is not initialized");
+            }
+            if (internal_net::sys_net_close(this->sockfd) < 0) {
                 throw std::runtime_error("failed to close socket");
             }
         }
-        /**
-         * @brief Close the socket.
-         */
-        void close() const override {
-            this->close({});
+        [[nodiscard]] sock_addr get_peer() const {
+            return ssock::sock::get_peer(this->sockfd);
         }
     };
+    sock_addr get_peer(int sockfd);
     /**
      * @brief Resolve a hostname to an IP address.
      * @param hostname The hostname to resolve.
@@ -1211,6 +1187,38 @@ namespace ssock::sock {
 
         return {std::move(v4), std::move(v6)};
     }
+    static sock_addr get_peer(int sockfd) {
+        sockaddr_storage addr_storage{};
+        socklen_t addr_len = sizeof(addr_storage);
+
+        if (getpeername(sockfd, reinterpret_cast<sockaddr*>(&addr_storage), &addr_len) < 0) {
+            throw std::runtime_error("getpeername() failed: " + std::string(strerror(errno)));
+        }
+
+        char ip_str[INET6_ADDRSTRLEN] = {0};
+        uint16_t port = 0;
+
+        if (addr_storage.ss_family == AF_INET) {
+            auto* addr_in = reinterpret_cast<sockaddr_in*>(&addr_storage);
+            inet_ntop(AF_INET, &(addr_in->sin_addr), ip_str, sizeof(ip_str));
+            port = ntohs(addr_in->sin_port);
+        } else if (addr_storage.ss_family == AF_INET6) {
+            auto* addr_in6 = reinterpret_cast<sockaddr_in6*>(&addr_storage);
+            inet_ntop(AF_INET6, &(addr_in6->sin6_addr), ip_str, sizeof(ip_str));
+            port = ntohs(addr_in6->sin6_port);
+        } else {
+            throw std::runtime_error("unsupported address family");
+        }
+
+        sock_addr addr{};
+        addr.ip = ip_str;
+        addr.port = port;
+        addr.type = (addr_storage.ss_family == AF_INET) ?
+            sock_addr_type::ipv4 : sock_addr_type::ipv6;
+
+        return addr;
+    }
+
     /**
      * @brief Check if a string is a valid IPv4 address.
      * @param ip The string to check.
@@ -1276,12 +1284,12 @@ namespace ssock::http {
         T body{};
     public:
         explicit basic_body_parser(T& input) : input(input), ret({}) {}
+        virtual ~basic_body_parser() = default;
         virtual VPS& get_headers() = 0;
         virtual T& get_body() = 0;
         virtual T& get_input() = 0;
         virtual T decode_chunked(const std::string& encoded) = 0;
         virtual int get_status_code() = 0;
-        virtual ~basic_body_parser() = 0;
         virtual R& parse() = 0;
     };
 
@@ -1330,6 +1338,7 @@ namespace ssock::http {
                 }
             }
         }
+        ~body_parser() override = default;
 
         /**
          * @brief Decode chunked transfer encoding.
@@ -1470,7 +1479,7 @@ namespace ssock::http {
             sock::sync_sock sock(addr, sock::sock_type::tcp);
             sock.connect();
             sock.send(request);
-            return sock.recv(this->timeout);
+            return sock.recv(this->timeout, "\r\n\r\n");
         }
     public:
         /**
