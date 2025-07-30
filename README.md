@@ -33,7 +33,6 @@ Still missing:
 - Server abstraction
 - Asynchronous sockets
 - SSL/TLS support (would require external dependencies)
-- Custom exceptions
 
 ## Dependencies
 

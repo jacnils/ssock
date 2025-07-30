@@ -10,11 +10,11 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <stdexcept>
 #include <cstring>
 #include <unordered_map>
 #include <variant>
 #include <algorithm>
+#include <ranges>
 
 #ifndef SSOCK
 #define SSOCK 1
@@ -48,6 +48,66 @@ namespace ssock::internal_net {
     static constexpr auto sys_net_select = select;
     static constexpr auto sys_net_setsockopt = setsockopt;
 #endif
+}
+
+namespace ssock {
+    using exception_type = std::exception;
+
+    /**
+      * @brief A class to represent an exception in a socket operation.
+      */
+    class socket_error : public exception_type {
+        const char* message{"Socket error"};
+    public:
+        [[nodiscard]] const char* what() const noexcept override {
+            return message;
+        }
+        socket_error() = default;
+        explicit socket_error(const char* message) : message(message) {};
+        explicit socket_error(const std::string& string) : message(string.c_str()) {};
+    };
+
+    /**
+      * @brief A class to represent an exception trying to parse.
+      */
+    class parsing_error : public exception_type {
+        const char* message{"Parsing error"};
+    public:
+        [[nodiscard]] const char* what() const noexcept override {
+            return message;
+        }
+        parsing_error() = default;
+        explicit parsing_error(const char* message) : message(message) {};
+        explicit parsing_error(const std::string& string) : message(string.c_str()) {};
+    };
+
+    /**
+      * @brief A class to represent an exception with an IP address.
+      */
+    class ip_error : public exception_type {
+        const char* message{"IP error"};
+    public:
+        [[nodiscard]] const char* what() const noexcept override {
+            return message;
+        }
+        ip_error() = default;
+        explicit ip_error(const char* message) : message(message) {};
+        explicit ip_error(const std::string& string) : message(string.c_str()) {};
+    };
+
+    /**
+      * @brief A class to represent an exception in DNS resolution.
+      */
+    class dns_error : public exception_type {
+        const char* message{"DNS error"};
+    public:
+        [[nodiscard]] const char* what() const noexcept override {
+            return message;
+        }
+        dns_error() = default;
+        explicit dns_error(const char* message) : message(message) {}
+        explicit dns_error(const std::string& string) : message(string.c_str()) {};
+    };
 }
 
 /**
@@ -93,19 +153,19 @@ namespace ssock::network {
         }
         [[nodiscard]] std::string get_ipv4() const {
             if (!this->contains_ipv4()) {
-                throw std::runtime_error("sock_ip_list(): no IPv4 address");
+                throw ip_error("sock_ip_list(): no IPv4 address");
             }
             return v4;
         }
         [[nodiscard]] std::string get_ipv6() const {
             if (!this->contains_ipv6()) {
-                throw std::runtime_error("sock_ip_list(): no IPv6 address");
+                throw ip_error("sock_ip_list(): no IPv6 address");
             }
             return v6;
         }
         [[nodiscard]] std::string get_ip() const {
             if (v4.empty() && v6.empty()) {
-                throw std::runtime_error("sock_ip_list(): no IP address");
+                throw ip_error("sock_ip_list(): no IP address");
             }
             return v6.empty() ? v4 : v6;
         }
@@ -299,13 +359,13 @@ namespace ssock::network {
 
             void throw_if_invalid() const {
                 if (hostname.empty()) {
-                    throw std::runtime_error("dns_resolver(): hostname cannot be empty");
+                    throw parsing_error("dns_resolver(): hostname cannot be empty");
                 }
                 if (hostname.find('.') == std::string::npos) {
-                    throw std::runtime_error("dns_resolver(): hostname must contain at least one dot (.)");
+                    throw parsing_error("dns_resolver(): hostname must contain at least one dot (.)");
                 }
                 if (hostname.back() == '.') {
-                    throw std::runtime_error("dns_resolver(): hostname cannot end with a dot (.)");
+                    throw parsing_error("dns_resolver(): hostname cannot end with a dot (.)");
                 }
             }
 
@@ -333,7 +393,7 @@ namespace ssock::network {
                 auto it = type_map.find(key);
                 if (it != type_map.end()) return it->second;
 
-                throw std::invalid_argument("dns_type_from_string(): unknown DNS type: " + type_str);
+                throw dns_error("dns_type_from_string(): unknown DNS type: " + type_str);
             }
 
             static int resolve_query_type(const dns_selector& selector) {
@@ -358,7 +418,7 @@ namespace ssock::network {
                     } else {
                         static_assert(always_false<T>::value, "unhandled selector type");
                     }
-                    throw std::invalid_argument("resolve_query_type(): unhandled selector type");
+                    throw dns_error("resolve_query_type(): unhandled selector type");
                 }, selector);
             }
         public:
@@ -394,7 +454,7 @@ namespace ssock::network {
 
                 int status = getaddrinfo(this->hostname.c_str(), std::to_string(port).c_str(), &hints, &res);
                 if (status != 0) {
-                    throw std::runtime_error("resolve_hostname(): function getaddrinfo returned: " + std::string(gai_strerror(status)));
+                    throw dns_error("resolve_hostname(): getaddrinfo failed: " + std::string(gai_strerror(status)));
                 }
 
                 std::string v4{};
@@ -412,7 +472,7 @@ namespace ssock::network {
                         addr = &(ipv6->sin6_addr);
                     } else {
                         freeaddrinfo(res);
-                        throw std::runtime_error("unknown address family");
+                        throw dns_error("resolve_hostname(): unknown address family");
                     }
 
                     inet_ntop(p->ai_family, addr, ipstr, sizeof(ipstr));
@@ -442,7 +502,7 @@ namespace ssock::network {
                                   << " record found for: " << hostname << std::endl;
                         return {};
                     }
-                    throw std::runtime_error("query_records(): res_query failed: " + std::string(hstrerror(h_errno)));
+                    throw dns_error("query_records(): res_query failed: " + std::string(hstrerror(h_errno)));
                 }
 
                 ns_msg handle;
@@ -450,7 +510,7 @@ namespace ssock::network {
                     if (ns_initparse(response, len, &handle) < 0) {
                         std::string error = "query_records(): DNS response parse failed with error: " + std::string(hstrerror(h_errno));
                         error += ", length: " + std::to_string(len);
-                        throw std::runtime_error(error);
+                        throw parsing_error("query_records(): DNS response parse failed: " + error);
                     }
                 }
 
@@ -499,7 +559,7 @@ namespace ssock::network {
                             int offset = 0;
                             while (offset < rdlen) {
                                 uint8_t slen = rdata[offset];
-                                txt.text.emplace_back((const char*)&rdata[offset + 1], slen);
+                                txt.text.emplace_back(reinterpret_cast<const char*>(&rdata[offset + 1]), slen);
                                 offset += slen + 1;
                             }
                             rec.type = dns_record_type::TXT;
@@ -534,6 +594,24 @@ namespace ssock::network {
      */
     static bool usable_ipv6_address_exists();
     /**
+     * @brief A function that checks if a string is a valid IPv4 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv4 address, false otherwise.
+     */
+    static bool is_ipv4(const std::string& ip);
+    /**
+     * @brief A function that checks if a string is a valid IPv6 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv6 address, false otherwise.
+     */
+    static bool is_ipv6(const std::string& ip);
+    /**
+     * @brief A function that checks if a port is valid.
+     * @param port The port to check.
+     * @return True if the port is valid, false otherwise.
+     */
+    static bool is_valid_port(int port);
+    /**
      * @brief Get a list of all network interfaces on the system.
      * @return A vector of network_interface objects.
      * @throws std::runtime_error if getifaddrs() fails.
@@ -543,7 +621,7 @@ namespace ssock::network {
 
         struct ifaddrs* ifaddr;
         if (getifaddrs(&ifaddr) == -1) {
-            throw std::runtime_error{"getifaddrs() failed in get_interfaces()"};
+            throw ssock::ip_error{"getifaddrs() failed in get_interfaces()"};
         }
 
         std::unordered_map<std::string, network_interface> iface_map;
@@ -627,7 +705,7 @@ namespace ssock::network {
         freeifaddrs(ifaddr);
 
         list.reserve(iface_map.size());
-        for (auto&[fst, snd] : iface_map) {
+        for (auto& [fst, snd] : iface_map) {
             list.emplace_back(std::move(snd));
         }
 
@@ -656,6 +734,32 @@ namespace ssock::network {
         }
 
         return false;
+    }
+    /**
+     * @brief Check if a string is a valid IPv4 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv4 address, false otherwise.
+     */
+    static bool is_ipv4(const std::string& ip) {
+        sockaddr_in sa{};
+        return inet_pton(AF_INET, ip.c_str(), &(sa.sin_addr)) != 0;
+    }
+    /**
+     * @brief Check if a string is a valid IPv6 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv6 address, false otherwise.
+     */
+    static bool is_ipv6(const std::string& ip) {
+        sockaddr_in6 sa{};
+        return inet_pton(AF_INET6, ip.c_str(), &(sa.sin6_addr)) != 0;
+    }
+    /**
+     * @brief Check if a port is valid.
+     * @param port The port to check.
+     * @return True if the port is valid, false otherwise.
+     */
+    static bool is_valid_port(const int port) {
+        return port > 0 && port <= 65535;
     }
 }
 
@@ -699,25 +803,6 @@ namespace ssock::sock {
     }
 
     using sock_ip_list = network::sock_ip_list;
-
-    /**
-     * @brief A function that checks if a string is a valid IPv4 address.
-     * @param ip The string to check.
-     * @return True if the string is a valid IPv4 address, false otherwise.
-     */
-    static bool is_ipv4(const std::string& ip);
-    /**
-     * @brief A function that checks if a string is a valid IPv6 address.
-     * @param ip The string to check.
-     * @return True if the string is a valid IPv6 address, false otherwise.
-     */
-    static bool is_ipv6(const std::string& ip);
-    /**
-     * @brief A function that checks if a port is valid.
-     * @param port The port to check.
-     * @return True if the port is valid, false otherwise.
-     */
-    static bool is_valid_port(int port);
 
     /**
      * @brief Get the peer address of a socket.
@@ -778,15 +863,15 @@ namespace ssock::sock {
             } else if (type == sock_addr_type::ipv4 || type == sock_addr_type::ipv6) {
                 ip = hostname;
             } else {
-                throw std::runtime_error("sock_addr(): invalid address type");
+                throw ip_error("sock_addr(): invalid address type");
             }
 
             if (ip.empty()) {
-                throw std::runtime_error("sock_addr(): could not resolve hostname or invalid IP address");
+                throw ip_error("sock_addr(): could not resolve hostname or invalid IP address");
             }
 
-            if (!sock::is_ipv4(ip) && !sock::is_ipv6(ip)) {
-                throw std::runtime_error("sock_addr(): invalid address type (constructor)");
+            if (!network::is_ipv4(ip) && !network::is_ipv6(ip)) {
+                throw parsing_error("sock_addr(): invalid address type (constructor)");
             }
 
             if (this->hostname == ip) {
@@ -830,7 +915,7 @@ namespace ssock::sock {
          */
         std::string& get_hostname() {
             if (hostname.empty()) {
-                throw std::runtime_error("hostname is empty, use get_ip() instead");
+                throw parsing_error("hostname is empty, use get_ip() instead");
             }
             return hostname;
         }
@@ -840,7 +925,7 @@ namespace ssock::sock {
          */
         [[nodiscard]] std::string get_hostname() const {
             if (hostname.empty()) {
-                throw std::runtime_error("hostname is empty, use get_ip() instead");
+                throw parsing_error("hostname is empty, use get_ip() instead");
             }
             return hostname;
         }
@@ -895,7 +980,7 @@ namespace ssock::sock {
             if (addr.is_ipv4()) return sizeof(sockaddr_in);
             if (addr.is_ipv6()) return sizeof(sockaddr_in6);
 
-            throw std::runtime_error("Invalid address type");
+            throw socket_error("invalid address type");
         }
 
         void prep_sa() {
@@ -905,17 +990,17 @@ namespace ssock::sock {
                 sa4->sin_family = AF_INET;
                 sa4->sin_port = htons(addr.get_port());
                 if (inet_pton(AF_INET, addr.get_ip().c_str(), &sa4->sin_addr) <= 0) {
-                    throw std::runtime_error("Invalid IPv4 address");
+                    throw parsing_error("invalid IPv4 address");
                 }
             } else if (addr.is_ipv6()) {
                 auto* sa6 = reinterpret_cast<sockaddr_in6*>(&sa_storage);
                 sa6->sin6_family = AF_INET6;
                 sa6->sin6_port = htons(addr.get_port());
                 if (inet_pton(AF_INET6, addr.get_ip().c_str(), &sa6->sin6_addr) <= 0) {
-                    throw std::runtime_error("Invalid IPv6 address");
+                    throw parsing_error("invalid IPv6 address");
                 }
             } else {
-                throw std::runtime_error("Invalid address type");
+                throw ip_error("invalid address type");
             }
         }
     public:
@@ -927,14 +1012,14 @@ namespace ssock::sock {
          */
         sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr) : addr(addr), type(t) {
             if (addr.get_ip().empty()) {
-                throw std::runtime_error("IP address is empty");
+                throw socket_error("IP address is empty");
             }
 
             this->sockfd = internal_net::sys_net_socket(addr.is_ipv6() ? AF_INET6 : AF_INET,
                                                               t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
 
             if (this->sockfd < 0) {
-                throw std::runtime_error("failed to create socket");
+                throw socket_error("failed to create socket");
             }
 
             if (opts & sock_opt::reuse_addr) {
@@ -968,7 +1053,7 @@ namespace ssock::sock {
          */
         void connect() override {
             if (internal_net::sys_net_connect(this->sockfd, this->get_sa(), this->get_sa_len()) < 0) {
-                throw std::runtime_error("failed to connect to server");
+                throw socket_error("failed to connect to server");
             }
         }
         /**
@@ -996,7 +1081,7 @@ namespace ssock::sock {
             auto ret = internal_net::sys_net_bind(this->sockfd, this->get_sa(), this->get_sa_len());
 
             if (ret < 0) {
-                throw std::runtime_error("failed to bind socket: " + std::to_string(ret));
+                throw socket_error("failed to bind socket: " + std::to_string(ret));
             }
         }
         /**
@@ -1005,7 +1090,7 @@ namespace ssock::sock {
         void unbind() override {
             if (this->bound) {
                 if (internal_net::sys_net_close(this->sockfd) < 0) {
-                    throw std::runtime_error("failed to unbind socket");
+                    throw socket_error("failed to unbind socket");
                 }
                 this->bound = false;
             }
@@ -1017,7 +1102,7 @@ namespace ssock::sock {
          */
         void listen(int backlog) override {
             if (internal_net::sys_net_listen(this->sockfd, backlog) < 0) {
-                throw std::runtime_error("failed to listen on socket");
+                throw socket_error("failed to listen on socket");
             }
         }
         /**
@@ -1030,7 +1115,7 @@ namespace ssock::sock {
 
             int client_sockfd = internal_net::sys_net_accept(this->sockfd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
             if (client_sockfd < 0) {
-                throw std::runtime_error("failed to accept connection: " + std::string(strerror(errno)));
+                throw socket_error("failed to accept connection: " + std::string(strerror(errno)));
             }
 
             auto peer = sock::get_peer(client_sockfd);
@@ -1058,12 +1143,7 @@ namespace ssock::sock {
         }
         /**
          * @brief Receive data from the server.
-         * @param timeout_seconds The timeout in seconds (default is -1, which means no timeout).
-         * @return The received data as a string.
-         */
-        /**
-         * @brief Receive data from the server.
-         * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely until match is found).
+         * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely until match is found)
          * @param match The substring to look for in received data.
          * @return The received data as a string.
          */
@@ -1094,7 +1174,7 @@ namespace ssock::sock {
                 int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr, tv_ptr);
 
                 if (ret < 0) {
-                    throw std::runtime_error("select() failed");
+                    throw socket_error("select() failed");
                 }
                 if (ret == 0) {
                     continue;
@@ -1129,10 +1209,10 @@ namespace ssock::sock {
          */
         void close() override {
             if (!this->sockfd) {
-                throw std::runtime_error("socket is not initialized");
+                throw socket_error("socket is not initialized");
             }
             if (internal_net::sys_net_close(this->sockfd) < 0) {
-                throw std::runtime_error("failed to close socket");
+                throw socket_error("failed to close socket");
             }
         }
         [[nodiscard]] sock_addr get_peer() const {
@@ -1154,7 +1234,7 @@ namespace ssock::sock {
 
         int status = getaddrinfo(hostname.c_str(), std::to_string(port).c_str(), &hints, &res);
         if (status != 0) {
-            throw std::runtime_error("resolve_hostname(): function getaddrinfo returned: " + std::string(gai_strerror(status)));
+            throw dns_error("resolve_hostname(): function getaddrinfo returned: " + std::string(gai_strerror(status)));
         }
 
         std::string v4{};
@@ -1172,7 +1252,7 @@ namespace ssock::sock {
                 addr = &(ipv6->sin6_addr);
             } else {
                 freeaddrinfo(res);
-                throw std::runtime_error("unknown address family");
+                throw ip_error("unknown address family");
             }
 
             inet_ntop(p->ai_family, addr, ipstr, sizeof(ipstr));
@@ -1192,7 +1272,7 @@ namespace ssock::sock {
         socklen_t addr_len = sizeof(addr_storage);
 
         if (getpeername(sockfd, reinterpret_cast<sockaddr*>(&addr_storage), &addr_len) < 0) {
-            throw std::runtime_error("getpeername() failed: " + std::string(strerror(errno)));
+            throw socket_error("getpeername() failed: " + std::string(strerror(errno)));
         }
 
         char ip_str[INET6_ADDRSTRLEN] = {0};
@@ -1207,7 +1287,7 @@ namespace ssock::sock {
             inet_ntop(AF_INET6, &(addr_in6->sin6_addr), ip_str, sizeof(ip_str));
             port = ntohs(addr_in6->sin6_port);
         } else {
-            throw std::runtime_error("unsupported address family");
+            throw ip_error("unsupported address family");
         }
 
         sock_addr addr{};
@@ -1284,6 +1364,7 @@ namespace ssock::http {
         T body{};
     public:
         explicit basic_body_parser(T& input) : input(input), ret({}) {}
+        explicit basic_body_parser() = default;
         virtual ~basic_body_parser() = default;
         virtual VPS& get_headers() = 0;
         virtual T& get_body() = 0;
@@ -1314,7 +1395,7 @@ namespace ssock::http {
             constexpr auto HEADER_END = "\r\n\r\n";
             const auto pos = input.find(HEADER_END);
             if (pos == std::string::npos) {
-                throw std::runtime_error("no header terminator");
+                throw parsing_error("no header terminator");
             }
             this->body = input.substr(pos + strlen(HEADER_END));
 
@@ -1378,7 +1459,7 @@ namespace ssock::http {
          */
         [[nodiscard]] int get_status_code() override {
             if (input.find("HTTP/") == std::string::npos) {
-                throw std::runtime_error("failed to parse status code");
+                throw parsing_error("failed to parse status code");
             }
             std::string line{};
             if (input.find('\n') != std::string::npos) {
@@ -1388,7 +1469,7 @@ namespace ssock::http {
             }
 
             if (line.empty()) {
-                throw std::runtime_error("failed to parse status code");
+                throw parsing_error("failed to parse status code");
             }
 
             if (line.back() == '\r') line.pop_back();
@@ -1401,11 +1482,11 @@ namespace ssock::http {
             iss >> version >> status_code;
 
             if (iss.fail()) {
-                throw std::runtime_error("failed to parse status code");
+                throw parsing_error("failed to parse status code");
             }
 
             if (status_code < 100 || status_code > 599) {
-                throw std::runtime_error("invalid status code");
+                throw parsing_error("invalid status code");
             }
 
             return status_code;
@@ -1492,14 +1573,14 @@ namespace ssock::http {
          * @param timeout The timeout in seconds (default is -1, which means no timeout).
          */
         client(const std::string& hostname, const std::string& path, int port, method m, version v = version::HTTP_1_1, int timeout = -1) : hostname(hostname), path(path), port(port), m(m), v(v), timeout(timeout) {
-            if (!ssock::sock::is_valid_port(port)) {
-                throw std::runtime_error("Invalid port");
+            if (!sock::is_valid_port(port)) {
+                throw parsing_error("invalid port");
             }
             if (hostname.empty()) {
-                throw std::runtime_error("Hostname is empty");
+                throw parsing_error("hostname is empty");
             }
             if (path.empty() || path[0] != '/') {
-                throw std::runtime_error("path is empty");
+                throw parsing_error("path is empty");
             }
 
             this->method_str = (m == method::GET) ? "GET" : "POST";
@@ -1513,7 +1594,7 @@ namespace ssock::http {
         void append_headers(const std::vector<std::pair<std::string, std::string>>& headers) {
             for (const auto& [key, value] : headers) {
                 if (key == "Host" || key == "Content-Length") {
-                    throw std::runtime_error("illegal header: " + key);
+                    throw parsing_error("illegal header: " + key);
                 }
                 this->headers.emplace_back(key, value);
             }
@@ -1532,7 +1613,7 @@ namespace ssock::http {
          */
         void set_header(const std::string& key, const std::string& value) {
             if (key == "Host" || key == "Content-Length") {
-                throw std::runtime_error("illegal header: " + key);
+                throw parsing_error("illegal header: " + key);
             }
             this->headers.emplace_back(key, value);
         }
@@ -1669,6 +1750,7 @@ namespace ssock::http {
          * @brief Get the response from the server.
          * @return response object, parsed.
          */
+        template <typename T = body_parser<std::string>>
         [[nodiscard]] response get() const {
             std::string body{};
             body += this->method_str + " " + this->path + " " + this->version_str + "\r\n";
@@ -1688,7 +1770,7 @@ namespace ssock::http {
 
             auto ret = this->make_request(body);
 
-            body_parser parser{ret};
+            T parser(ret);
 
             return parser.parse();
         }
