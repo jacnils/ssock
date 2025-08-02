@@ -1269,9 +1269,29 @@ namespace ssock::sock {
             this->prep_sa();
         }
 #endif
+#ifdef SSOCK_UNIX
         ~sync_sock() override {
-            this->sync_sock::close();
+            if (!this->sockfd) {
+                return;
+            }
+            if (internal_net::sys_net_close(this->sockfd) < 0) {
+                ;
+            }
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        ~sync_sock() override {
+            if (this->sockfd == INVALID_SOCKET) {
+                return;
+            }
+
+            if (::closesocket(this->sockfd) == SOCKET_ERROR) {
+                return;
+            }
+
+            this->sockfd = INVALID_SOCKET;
+        }
+#endif
         /**
          * @brief Get the socket address.
          * @return sock_addr& reference
