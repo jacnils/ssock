@@ -24,6 +24,7 @@ polished this up and released it as a standalone library for Unix.
 - Exceptions for errors
 - Inheritable classes for easy extension
 - C++23
+- Support for Windows, Linux, macOS and other Unix-compatible systems.
 - No dependencies*
 
 *DNS resolution requires resolv, and you may need to link against it on some systems.

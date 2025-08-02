@@ -18,9 +18,23 @@ target_include_directories(ssock
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
+if(WIN32)
+    target_link_libraries(ssock INTERFACE
+            ws2_32
+            iphlpapi
+            dnsapi
+    )
+else()
+    target_link_libraries(ssock INTERFACE
+            resolv
+    )
+endif()
 
-install(DIRECTORY include/
-        DESTINATION include)
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+        DESTINATION include
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp" PATTERN "*.hxx"
+)
+
 
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(
@@ -45,8 +59,24 @@ install(TARGETS ssock
         ARCHIVE DESTINATION lib
 )
 
-add_executable(ssock-build-test test_header.cpp)
-target_link_libraries(ssock-build-test
-        resolv
+install(EXPORT ssockTargets
+        FILE ssockTargets.cmake
+        NAMESPACE ssock::
+        DESTINATION lib/cmake/ssock
 )
+
+add_executable(ssock-build-test test_header.cpp)
+
+if (WIN32)
+    target_link_libraries(ssock-build-test
+            ws2_32
+            iphlpapi
+            dnsapi
+    )
+else()
+    target_link_libraries(ssock-build-test
+            resolv
+    )
+endif()
+
 include_directories(include)
