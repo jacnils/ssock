@@ -8,7 +8,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include_directories(/usr/local/include)
 
+find_package(ssock)
+
 add_executable(
         ssock-example
         main.cpp
 )
+target_link_libraries(ssock-example PRIVATE ssock::ssock)

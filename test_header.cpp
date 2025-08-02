@@ -192,26 +192,30 @@ void test_http_abstr() {
 }
 
 int main() {
-    std::cout << "ssock.hpp" << std::endl;
-    test_socket();
-    test_dns("google.com");
-    test_dns("forwarderfactory.com");
-    test_dns("jacobnilsson.com");
-    test_dns_steps("google.com");
-    test_dns_steps("forwarderfactory.com");
-    test_dns_steps("jacobnilsson.com");
+    try {
+        std::cout << "ssock.hpp" << std::endl;
+        test_socket();
+        test_dns("google.com");
+        test_dns("forwarderfactory.com");
+        test_dns("jacobnilsson.com");
+        test_dns_steps("google.com");
+        test_dns_steps("forwarderfactory.com");
+        test_dns_steps("jacobnilsson.com");
 
-    std::thread server_thread([]() {
-        try {
-            test_http_server();
-        } catch (const std::exception& e) {
-            std::cerr << "HTTP Server Error: " << e.what() << std::endl;
-        }
-    });
-    server_thread.detach();
-    std::this_thread::sleep_for(std::chrono::seconds(2)); // give the server time to start
+        std::thread server_thread([]() {
+            try {
+                test_http_server();
+            } catch (const std::exception& e) {
+                std::cerr << "HTTP Server Error: " << e.what() << std::endl;
+            }
+        });
+        server_thread.detach();
+        std::this_thread::sleep_for(std::chrono::seconds(2)); // give the server time to start
 
-    test_http_abstr();
+        test_http_abstr();
 
-    return EXIT_SUCCESS;
+        return EXIT_SUCCESS;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
 }

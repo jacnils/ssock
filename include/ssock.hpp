@@ -22,6 +22,7 @@
 // SSOCK_DEBUG
 
 #if defined(__unix__) || defined(__unix) || defined(__APPLE__) && defined(__MACH__)
+#define SSOCK_UNIX
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -30,6 +31,52 @@
 #include <arpa/nameser.h>
 #include <resolv.h>
 #include <unistd.h>
+#elif _WIN32
+#define SSOCK_WINDOWS
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windns.h>
+#include <iphlpapi.h>
+
+static constexpr int ns_t_a{1};
+static constexpr int ns_t_ns{2};
+static constexpr int ns_t_cname{5};
+static constexpr int ns_t_soa{6};
+static constexpr int ns_t_ptr{12};
+static constexpr int ns_t_mx{15};
+static constexpr int ns_t_txt{16};
+static constexpr int ns_t_aaaa{28};
+static constexpr int ns_t_srv{33};
+static constexpr int ns_t_any{255};
+static constexpr int ns_t_caa{257};
+
+namespace ssock::internal_net {
+    inline void ensure_winsock_initialized() {
+        static bool initialized = [] {
+            WSADATA wsaData;
+            std::cout << "WSAStartup called";
+            int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+            if (result != 0) {
+                throw std::runtime_error("WSAStartup failed with code " + std::to_string(result));
+            }
+
+            std::atexit([] {
+                WSACleanup();
+            });
+
+            return true;
+        }();
+        static_cast<void>(initialized);
+    }
+
+    struct winsock_auto_init {
+        winsock_auto_init() {
+            ssock::internal_net::ensure_winsock_initialized();
+        }
+    };
+
+    [[maybe_unused]] static winsock_auto_init _winsock_init;
+}
 #else
 #error "Unsupported platform. Please file a pull request to add support for your platform."
 #endif
@@ -487,6 +534,7 @@ namespace ssock::network {
 
                 return {std::move(v4), std::move(v6)};
             }
+#ifdef SSOCK_UNIX
             [[nodiscard]] std::vector<dns_record> query_records(const dns_selector& selector = std::monostate{}) const {
                 throw_if_invalid();
 
@@ -498,8 +546,6 @@ namespace ssock::network {
                 int len = res_query(hostname.c_str(), ns_c_in, qtype, response, sizeof(response));
                 if (len < 0) {
                     if (h_errno == NO_DATA) {
-                        std::cerr << "No " << ((qtype == ns_t_a) ? "A" : "requested")
-                                  << " record found for: " << hostname << std::endl;
                         return {};
                     }
                     throw dns_error("query_records(): res_query failed: " + std::string(hstrerror(h_errno)));
@@ -578,7 +624,82 @@ namespace ssock::network {
 
                 return records;
             }
+#endif
+#ifdef SSOCK_WINDOWS
+            [[nodiscard]] std::vector<dns_record> query_records(const dns_selector& selector = std::monostate{}) const {
+                throw_if_invalid();
 
+                WORD qtype = resolve_query_type(selector);
+
+                PDNS_RECORD pRecord = nullptr;
+                DNS_STATUS status = DnsQuery_A(
+                    hostname.c_str(),
+                    qtype,
+                    DNS_QUERY_STANDARD,
+                    nullptr,
+                    &pRecord,
+                    nullptr
+                );
+
+                if (status == DNS_INFO_NO_RECORDS || status == DNS_ERROR_RCODE_NAME_ERROR) {
+                    return {};
+                }
+
+                if (status != 0 || pRecord == nullptr) {
+                    throw dns_error("query_records(): DnsQuery_A failed with error code: " + std::to_string(status));
+                }
+
+                std::vector<dns_record> records;
+
+                for (PDNS_RECORD rec = pRecord; rec != nullptr; rec = rec->pNext) {
+                    dns_record result;
+                    result.name = rec->pName;
+                    result.ttl = rec->dwTtl;
+                    result.type = dns_record_type::OTHER;
+
+                    switch (rec->wType) {
+                        case DNS_TYPE_A: {
+                            char ip[INET_ADDRSTRLEN];
+                            inet_ntop(AF_INET, &rec->Data.A.IpAddress, ip, sizeof(ip));
+                            result.type = dns_record_type::A;
+                            result.data = a_record_data{sock_ip_list{ip, ""}};
+                            break;
+                        }
+                        case DNS_TYPE_AAAA: {
+                            char ip[INET6_ADDRSTRLEN];
+                            inet_ntop(AF_INET6, rec->Data.AAAA.Ip6Address.IP6Byte, ip, sizeof(ip));
+                            result.type = dns_record_type::AAAA;
+                            result.data = aaaa_record_data{sock_ip_list{"", ip}};
+                            break;
+                        }
+                        case DNS_TYPE_CNAME: {
+                            result.type = dns_record_type::CNAME;
+                            result.data = cname_record_data{rec->Data.CNAME.pNameHost};
+                            break;
+                        }
+                        case DNS_TYPE_TEXT: {
+                            txt_record_data txt;
+                            for (DWORD i = 0; i < rec->Data.TXT.dwStringCount; ++i) {
+                                txt.text.emplace_back(rec->Data.TXT.pStringArray[i]);
+                            }
+                            result.type = dns_record_type::TXT;
+                            result.data = txt;
+                            break;
+                        }
+                        default: {
+                            result.data = generic_record_data{rec->wType, {}};
+                            break;
+                        }
+                    }
+
+                    records.push_back(std::move(result));
+                }
+
+                DnsRecordListFree(pRecord, DnsFreeRecordList);
+
+                return records;
+            }
+#endif
         };
     }
 
@@ -616,6 +737,7 @@ namespace ssock::network {
      * @return A vector of network_interface objects.
      * @throws std::runtime_error if getifaddrs() fails.
      */
+#ifdef SSOCK_UNIX
     inline std::vector<network_interface> get_interfaces() {
         std::vector<network_interface> list;
 
@@ -705,12 +827,87 @@ namespace ssock::network {
         freeifaddrs(ifaddr);
 
         list.reserve(iface_map.size());
-        for (auto& [fst, snd] : iface_map) {
+        for (auto& snd: iface_map | std::views::values) {
             list.emplace_back(std::move(snd));
         }
 
         return list;
     }
+#endif
+#ifdef SSOCK_WINDOWS
+    inline std::vector<network_interface> get_interfaces() {
+        std::vector<network_interface> list;
+        ULONG flags = GAA_FLAG_INCLUDE_PREFIX;
+        ULONG family = AF_UNSPEC;
+
+        ULONG out_buf_len = 15000;
+        std::vector<char> buffer(out_buf_len);
+
+        auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+
+        if (GetAdaptersAddresses(family, flags, nullptr, adapters, &out_buf_len) == ERROR_BUFFER_OVERFLOW) {
+            buffer.resize(out_buf_len);
+            adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+        }
+
+        DWORD ret = GetAdaptersAddresses(family, flags, nullptr, adapters, &out_buf_len);
+        if (ret != NO_ERROR) {
+            throw std::runtime_error("GetAdaptersAddresses() failed in get_interfaces()");
+        }
+
+        for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
+            network_interface iface;
+            iface.name = adapter->AdapterName;
+
+            iface.up = (adapter->OperStatus == IfOperStatusUp);
+            iface.running = iface.up;
+            iface.broadcast = true;
+            iface.point_to_point = false;
+
+            for (IP_ADAPTER_UNICAST_ADDRESS* unicast = adapter->FirstUnicastAddress; unicast != nullptr; unicast = unicast->Next) {
+                SOCKADDR* addr = unicast->Address.lpSockaddr;
+                char addr_str[INET6_ADDRSTRLEN] = {};
+                char netmask_str[INET6_ADDRSTRLEN] = {};
+
+                if (addr->sa_family == AF_INET) {
+                    auto sa = reinterpret_cast<sockaddr_in*>(addr);
+                    inet_ntop(AF_INET, &sa->sin_addr, addr_str, sizeof(addr_str));
+
+                    ULONG mask = (unicast->OnLinkPrefixLength == 0) ? 0 : 0xFFFFFFFF << (32 - unicast->OnLinkPrefixLength);
+                    in_addr netmask{};
+                    netmask.S_un.S_addr = htonl(mask);
+                    inet_ntop(AF_INET, &netmask, netmask_str, sizeof(netmask_str));
+
+                    iface.ipv4.emplace_back(
+                        std::string(addr_str),
+                        std::string(netmask_str),
+                        "",
+                        "",
+                        (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK),
+                        true
+                    );
+
+                } else if (addr->sa_family == AF_INET6) {
+                    auto sa6 = reinterpret_cast<sockaddr_in6*>(addr);
+                    inet_ntop(AF_INET6, &sa6->sin6_addr, addr_str, sizeof(addr_str));
+
+                    iface.ipv6.emplace_back(
+                        std::string(addr_str),
+                        "",
+                        (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK),
+                        true,
+                        static_cast<bool>(IN6_IS_ADDR_LINKLOCAL(&sa6->sin6_addr)),
+                        std::to_string(sa6->sin6_scope_id)
+                    );
+                }
+            }
+
+            list.emplace_back(std::move(iface));
+        }
+
+        return list;
+    }
+#endif
     /**
      * @brief Check if there is a usable IPv4 address on the system.
      * @return True if a usable IPv4 address exists, false otherwise.
@@ -774,7 +971,11 @@ namespace ssock::sock {
      * @brief Socket file descriptor type.
      * @note This is a typedef for int, but can be changed to a different type if needed.
      */
+#ifdef SSOCK_WINDOWS
+    using sock_fd_t = unsigned long long;
+#elifdef SSOCK_UNIX
     using sock_fd_t = int;
+#endif
     using sock_addr_type = network::sock_addr_type;
 
     /**
@@ -809,7 +1010,7 @@ namespace ssock::sock {
      * @param sockfd The socket file descriptor.
      * @return A sock_addr object that contains the peer address of the socket.
      */
-    static sock_addr get_peer(int sockfd);
+    static sock_addr get_peer(sock_fd_t sockfd);
     /**
      * @brief A class that represents a socket address.
      * @param hostname The hostname or IP address to resolve.
@@ -821,7 +1022,7 @@ namespace ssock::sock {
         std::string ip{};
         int port{};
         sock_addr_type type{sock_addr_type::hostname};
-        friend sock_addr get_peer(int);
+        friend sock_addr get_peer(sock_fd_t);
 
         sock_addr() = default;
     public:
@@ -836,11 +1037,14 @@ namespace ssock::sock {
                 try {
                     network::dns::dns_resolver resolver(h);
                     auto ip_list = resolver.resolve_hostname(p);
-                    return t ? ip_list.get_ipv6() : ip_list.get_ipv4();
-                } catch (const std::exception&) {
+                    auto ip = t ? ip_list.get_ipv6() : ip_list.get_ipv4();
+                    return ip;
+                } catch (const std::exception& ex) {
+                    std::cerr << "resolve_host exception: " << ex.what() << "\n";
                     return {};
                 }
             };
+
 
             if (type == sock_addr_type::hostname) {
                 ip = resolve_host(hostname, port, true);
@@ -968,7 +1172,7 @@ namespace ssock::sock {
     class sync_sock : basic_sync_sock {
         sock_addr addr;
         sock_type type{};
-        int sockfd{};
+        sock_fd_t sockfd{};
         sockaddr_storage sa_storage{};
         bool bound{false};
 
@@ -1010,6 +1214,7 @@ namespace ssock::sock {
          * @param t The socket type (tcp or udp).
          * @param opts The socket options (reuse_addr, no_reuse_addr).
          */
+#ifdef SSOCK_UNIX
         sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr) : addr(addr), type(t) {
             if (addr.get_ip().empty()) {
                 throw socket_error("IP address is empty");
@@ -1030,9 +1235,42 @@ namespace ssock::sock {
 
             this->prep_sa();
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr) : addr(addr), type(t) {
+            if (addr.get_ip().empty()) {
+                throw socket_error("IP address is empty");
+            }
 
+            this->sockfd = socket(
+                addr.is_ipv6() ? AF_INET6 : AF_INET,
+                t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM,
+                IPPROTO_IP
+            );
+
+            if (this->sockfd == INVALID_SOCKET) {
+                throw socket_error("Failed to create socket");
+            }
+
+            if (opts & sock_opt::reuse_addr) {
+                BOOL optval = TRUE;
+                if (setsockopt(this->sockfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to set SO_REUSEADDR");
+                }
+            } else if (opts & sock_opt::no_reuse_addr) {
+                BOOL optval = FALSE;
+                if (setsockopt(this->sockfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to clear SO_REUSEADDR");
+                }
+            }
+
+            this->prep_sa();
+        }
+#endif
         ~sync_sock() override {
-            internal_net::sys_net_close(sockfd);
+            this->sync_sock::close();
         }
         /**
          * @brief Get the socket address.
@@ -1051,32 +1289,26 @@ namespace ssock::sock {
         /**
          * @brief Connect the socket to the server.
          */
+#ifdef SSOCK_UNIX
         void connect() override {
             if (internal_net::sys_net_connect(this->sockfd, this->get_sa(), this->get_sa_len()) < 0) {
                 throw socket_error("failed to connect to server");
             }
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        void connect() override {
+            if (::connect(this->sockfd, this->get_sa(), this->get_sa_len()) == SOCKET_ERROR) {
+                throw socket_error("failed to connect to server");
+            }
+        }
+#endif
         /**
          * @brief Bind the socket to the address.
          */
+#ifdef SSOCK_UNIX
         void bind() override {
             this->bound = true;
-
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(this->addr.get_port());
-
-            sockaddr_in6 addr6{};
-            addr6.sin6_family = this->addr.is_ipv4() ? AF_INET : AF_INET6;
-            addr6.sin6_port = htons(this->addr.get_port());
-
-            if (this->addr.is_ipv4()) {
-                addr.sin_addr.s_addr = INADDR_ANY;
-                inet_pton(addr.sin_family, this->addr.get_ip().c_str(), &addr.sin_addr);
-            } else {
-                addr6.sin6_addr = in6addr_any;
-                inet_pton(addr6.sin6_family, this->addr.get_ip().c_str(), &addr6.sin6_addr);
-            }
 
             auto ret = internal_net::sys_net_bind(this->sockfd, this->get_sa(), this->get_sa_len());
 
@@ -1084,9 +1316,23 @@ namespace ssock::sock {
                 throw socket_error("failed to bind socket: " + std::to_string(ret));
             }
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        void bind() override {
+            this->bound = true;
+
+            int result = ::bind(this->sockfd, this->get_sa(), this->get_sa_len());
+
+            if (result == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                throw socket_error("failed to bind socket, error code: " + std::to_string(err));
+            }
+        }
+#endif
         /**
          * @brief Unbind the socket from the address.
          */
+#ifdef SSOCK_UNIX
         void unbind() override {
             if (this->bound) {
                 if (internal_net::sys_net_close(this->sockfd) < 0) {
@@ -1095,20 +1341,44 @@ namespace ssock::sock {
                 this->bound = false;
             }
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        void unbind() override {
+            if (this->bound) {
+                if (::closesocket(this->sockfd) == SOCKET_ERROR) {
+                    int err = WSAGetLastError();
+                    throw socket_error("failed to close socket, error code: " + std::to_string(err));
+                }
+                this->bound = false;
+                this->sockfd = INVALID_SOCKET;
+            }
+        }
+#endif
         /**
          * @brief Listen for incoming connections.
          * @param backlog The maximum number of pending connections (default is 5).
          * @note Very barebones, use with care.
          */
+#ifdef SSOCK_UNIX
         void listen(int backlog) override {
             if (internal_net::sys_net_listen(this->sockfd, backlog) < 0) {
                 throw socket_error("failed to listen on socket");
             }
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        void listen(int backlog) override {
+            if (::listen(this->sockfd, backlog) == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                throw socket_error("failed to listen socket, error code: " + std::to_string(err));
+            }
+        }
+#endif
         /**
          * @brief Accept a connection from a client.
          * @return sock_handle The socket handle for the accepted connection.
          */
+#ifdef SSOCK_UNIX
         [[nodiscard]] std::unique_ptr<sync_sock> accept() override {
             sockaddr_storage client_addr{};
             socklen_t addr_len = sizeof(client_addr);
@@ -1124,16 +1394,47 @@ namespace ssock::sock {
 
             return handle;
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        [[nodiscard]] std::unique_ptr<sync_sock> accept() override {
+            sockaddr_storage client_addr{};
+            int addr_len = sizeof(client_addr);
+
+            SOCKET client_sockfd = ::accept(this->sockfd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+            if (client_sockfd == INVALID_SOCKET) {
+                int err = WSAGetLastError();
+                throw socket_error("failed to accept connection, error code: " + std::to_string(err));
+            }
+
+            auto peer = sock::get_peer(client_sockfd);
+            auto handle = std::make_unique<sync_sock>(peer, this->type);
+            handle->sockfd = client_sockfd;
+
+            return handle;
+        }
+#endif
         /**
          * @brief Send data to the server.
          * @param buf The data to send.
          * @param len The length of the data.
          * @return The number of bytes sent.
          */
+#ifdef SSOCK_UNIX
         int send(const void* buf, size_t len) override {
             std::size_t ret = internal_net::sys_net_send(this->sockfd, buf, len, 0);
             return static_cast<int>(ret);
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        int send(const void* buf, size_t len) override {
+            int ret = ::send(this->sockfd, static_cast<const char*>(buf), static_cast<int>(len), 0);
+            if (ret == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                throw socket_error("send() failed, error code: " + std::to_string(err));
+            }
+            return ret;
+        }
+#endif
         /**
          * @brief Send a string to the server.
          * @param buf The string to send.
@@ -1147,6 +1448,7 @@ namespace ssock::sock {
          * @param match The substring to look for in received data.
          * @return The received data as a string.
          */
+#ifdef SSOCK_UNIX
         [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
             std::string data;
             auto start = std::chrono::steady_clock::now();
@@ -1166,7 +1468,7 @@ namespace ssock::sock {
                     if (remaining <= 0) {
                         break;
                     }
-                    tv.tv_sec = remaining;
+                    tv.tv_sec = static_cast<long>(remaining);
                     tv.tv_usec = 0;
                     tv_ptr = &tv;
                 }
@@ -1196,6 +1498,64 @@ namespace ssock::sock {
 
             return data;
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
+            std::string data;
+            auto start = std::chrono::steady_clock::now();
+
+            while (true) {
+                fd_set readfds;
+                FD_ZERO(&readfds);
+                FD_SET(this->sockfd, &readfds);
+
+                timeval tv{};
+                timeval* tv_ptr = nullptr;
+
+                if (timeout_seconds >= 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
+                    auto remaining = timeout_seconds - elapsed;
+                    if (remaining <= 0) {
+                        break;
+                    }
+                    tv.tv_sec = static_cast<long>(remaining);
+                    tv.tv_usec = 0;
+                    tv_ptr = &tv;
+                }
+
+                int ret = ::select(0, &readfds, nullptr, nullptr, tv_ptr);
+
+                if (ret == SOCKET_ERROR) {
+                    int err = WSAGetLastError();
+                    throw socket_error("select() failed, error code: " + std::to_string(err));
+                }
+                if (ret == 0) {
+                    continue;
+                }
+
+                if (FD_ISSET(this->sockfd, &readfds)) {
+                    char buf[1024];
+                    int received = ::recv(this->sockfd, buf, sizeof(buf), 0);
+                    if (received == 0) {
+                        break;
+                    }
+                    if (received == SOCKET_ERROR) {
+                        int err = WSAGetLastError();
+                        throw socket_error("recv() failed, error code: " + std::to_string(err));
+                    }
+
+                    data.append(buf, received);
+
+                    if (!match.empty() && data.find_last_of(match) != std::string::npos) {
+                        break;
+                    }
+                }
+            }
+
+            return data;
+        }
+#endif
         /* @brief Receive data from the server.
          * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
          * @return The received data as a string.
@@ -1207,19 +1567,35 @@ namespace ssock::sock {
         /**
          * @brief Close the socket.
          */
+#ifdef SSOCK_UNIX
         void close() override {
             if (!this->sockfd) {
-                throw socket_error("socket is not initialized");
+                return;
             }
             if (internal_net::sys_net_close(this->sockfd) < 0) {
                 throw socket_error("failed to close socket");
             }
         }
+#endif
+#ifdef SSOCK_WINDOWS
+        void close() override {
+            if (this->sockfd == INVALID_SOCKET) {
+                return;
+            }
+
+            if (::closesocket(this->sockfd) == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                throw socket_error("failed to close socket, error code: " + std::to_string(err));
+            }
+
+            this->sockfd = INVALID_SOCKET;
+        }
+#endif
         [[nodiscard]] sock_addr get_peer() const {
             return ssock::sock::get_peer(this->sockfd);
         }
     };
-    sock_addr get_peer(int sockfd);
+    sock_addr get_peer(sock_fd_t sockfd);
     /**
      * @brief Resolve a hostname to an IP address.
      * @param hostname The hostname to resolve.
@@ -1265,9 +1641,13 @@ namespace ssock::sock {
 
         freeaddrinfo(res);
 
+        if (v4.empty() && v6.empty()) {
+            throw ip_error("retrieved no v4 or v6 address");
+        }
+
         return {std::move(v4), std::move(v6)};
     }
-    static sock_addr get_peer(int sockfd) {
+    static sock_addr get_peer(sock_fd_t sockfd) {
         sockaddr_storage addr_storage{};
         socklen_t addr_len = sizeof(addr_storage);
 
