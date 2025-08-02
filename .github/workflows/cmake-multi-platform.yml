@@ -1,4 +1,4 @@
-name: CMake on Linux and macOS
+name: CMake on Linux, macOS, and Windows
 
 on:
   push:
@@ -20,6 +20,10 @@ jobs:
             c_compiler: clang
             cpp_compiler: clang++
             build_type: Release
+          - os: windows-latest
+            c_compiler: cl
+            cpp_compiler: cl
+            build_type: Release
 
     runs-on: ${{ matrix.os }}
 
@@ -35,8 +39,8 @@ jobs:
       - name: Configure CMake
         run: >
           cmake -B ${{ steps.strings.outputs.build-output-dir }}
-          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
           -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -S ${{ github.workspace }}
 
