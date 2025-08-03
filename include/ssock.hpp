@@ -17,6 +17,7 @@
 #include <ranges>
 #include <functional>
 #include <random>
+#include <filesystem>
 
 #ifndef SSOCK
 #define SSOCK 1
@@ -33,6 +34,7 @@
 #include <arpa/nameser.h>
 #include <resolv.h>
 #include <unistd.h>
+#include <netinet/tcp.h>
 #elif _WIN32
 #define SSOCK_WINDOWS
 #include <winsock2.h>
@@ -1176,7 +1178,11 @@ namespace ssock::sock {
     enum class sock_opt {
         reuse_addr = 1 << 0, /* Reuse address option */
         no_reuse_addr = 1 << 1, /* Do not reuse address option */
+        no_delay = 1 << 2, /* Disable Nagle's algorithm (TCP_NODELAY) */
+        keep_alive = 1 << 3, /* Enable keep-alive option */
+        no_keep_alive = 1 << 4, /* Disable keep-alive option */
     };
+
     inline sock_opt operator|(sock_opt lhs, sock_opt rhs) {
         using T = std::underlying_type_t<sock_opt>;
         return static_cast<sock_opt>(static_cast<T>(lhs) | static_cast<T>(rhs));
@@ -1402,7 +1408,7 @@ namespace ssock::sock {
          * @param opts The socket options (reuse_addr, no_reuse_addr).
          */
 #ifdef SSOCK_UNIX
-        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr) : addr(addr), type(t) {
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay) : addr(addr), type(t) {
             if (addr.get_ip().empty()) {
                 throw socket_error("IP address is empty");
             }
@@ -1418,6 +1424,14 @@ namespace ssock::sock {
                 internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opts, sizeof(opts));
             } else if (opts & sock_opt::no_reuse_addr) {
                 internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, nullptr, 0);
+            }
+            if (opts & sock_opt::no_delay) {
+                internal_net::sys_net_setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &opts, sizeof(opts));
+            }
+            if (opts & sock_opt::keep_alive) {
+                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &opts, sizeof(opts));
+            } else if (opts & sock_opt::no_keep_alive) {
+                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, nullptr, 0);
             }
 
             this->prep_sa();
@@ -1635,18 +1649,38 @@ namespace ssock::sock {
          */
 #ifdef SSOCK_UNIX
         int send(const void* buf, size_t len) override {
-            std::size_t ret = internal_net::sys_net_send(this->sockfd, buf, len, 0);
-            return static_cast<int>(ret);
+            size_t total_sent = 0;
+            const char* data = static_cast<const char*>(buf);
+
+            while (total_sent < len) {
+                ssize_t sent = internal_net::sys_net_send(this->sockfd, data + total_sent, len - total_sent, 0);
+                if (sent <= 0) {
+                    return sent;
+                }
+                total_sent += sent;
+            }
+
+            return static_cast<int>(total_sent);
         }
 #endif
 #ifdef SSOCK_WINDOWS
         int send(const void* buf, size_t len) override {
-            int ret = ::send(this->sockfd, static_cast<const char*>(buf), static_cast<int>(len), 0);
-            if (ret == SOCKET_ERROR) {
-                int err = WSAGetLastError();
-                throw socket_error("send() failed, error code: " + std::to_string(err));
+            size_t total_sent = 0;
+            const char* data = static_cast<const char*>(buf);
+
+            while (total_sent < len) {
+                int ret = ::send(this->sockfd, data + total_sent, static_cast<int>(len - total_sent), 0);
+                if (ret == SOCKET_ERROR) {
+                    int err = WSAGetLastError();
+                    throw socket_error("send() failed, error code: " + std::to_string(err));
+                }
+                if (ret == 0) {
+                    break;
+                }
+                total_sent += ret;
             }
-            return ret;
+
+            return static_cast<int>(total_sent);
         }
 #endif
         /**
@@ -1698,7 +1732,7 @@ namespace ssock::sock {
                 }
 
                 if (FD_ISSET(this->sockfd, &readfds)) {
-                    char buf[1024];
+                    char buf[8196];
                     std::size_t received = internal_net::sys_net_recv(this->sockfd, buf, sizeof(buf), 0);
                     if (received == 0) {
                         break;
@@ -1708,7 +1742,7 @@ namespace ssock::sock {
                         break;
                     }
 
-                    if (data.find_last_of(match) != std::string::npos && !match.empty()) {
+                    if (!match.empty() && data.find(match) != std::string::npos) {
                         break;
                     }
                 }
@@ -1753,7 +1787,7 @@ namespace ssock::sock {
                 }
 
                 if (FD_ISSET(this->sockfd, &readfds)) {
-                    char buf[1024];
+                    char buf[8196];
                     int received = ::recv(this->sockfd, buf, sizeof(buf), 0);
                     if (received == 0) {
                         break;
@@ -1768,7 +1802,7 @@ namespace ssock::sock {
                         break;
                     }
 
-                    if (!match.empty() && data.find_last_of(match) != std::string::npos) {
+                    if (!match.empty() && data.find(match) != std::string::npos) {
                         break;
                     }
                 }
@@ -1966,11 +2000,19 @@ namespace ssock::http {
         POST,
     };
 
+    /**
+     * @brief HTTP status codes and their messages.
+     * @note This is a list of common HTTP status codes and their messages.
+     */
     struct http_status_code {
         int code;
         std::string_view message;
     };
 
+    /**
+     * @brief List of HTTP status codes and their messages.
+     * @note This is a static array of http_status_code structs.
+     */
     static constexpr std::array<http_status_code, 63> http_status_list = {{
         {100, "Continue"},
         {101, "Switching Protocols"},
@@ -2037,6 +2079,11 @@ namespace ssock::http {
         {511, "Network Authentication Required"}
     }};
 
+    /**
+     * @brief Get the HTTP message for a given status code.
+     * @param code The HTTP status code.
+     * @return An optional string_view containing the message, or std::nullopt if the code is not found.
+     */
     constexpr std::optional<std::string_view> get_http_message(int code) {
         for (const auto& status : http_status_list) {
             if (status.code == code)
@@ -2045,6 +2092,10 @@ namespace ssock::http {
         return std::nullopt;
     }
 
+    /**
+     * @brief Get the list of HTTP status codes.
+     * @return A constant reference to the array of HTTP status codes.
+     */
     constexpr const std::array<http_status_code, http_status_list.size()>& get_http_status_codes() {
         return http_status_list;
     }
@@ -2233,7 +2284,7 @@ namespace ssock::http {
             std::string raw;
             std::string headers;
             while (true) {
-                std::string chunk = sock.recv(this->timeout, 1024);
+                std::string chunk = sock.recv(this->timeout, 8192);
                 if (chunk.empty()) throw std::runtime_error("connection closed during headers");
                 raw += chunk;
                 if (auto pos = raw.find("\r\n\r\n"); pos != std::string::npos) {
@@ -2261,7 +2312,7 @@ namespace ssock::http {
             if (is_chunked) {
                 std::string chunked_data = std::move(raw);
                 while (chunked_data.find("0\r\n\r\n") == std::string::npos) {
-                    std::string chunk = sock.recv(this->timeout, 1024);
+                    std::string chunk = sock.recv(this->timeout, 8192);
                     if (chunk.empty()) throw std::runtime_error("connection closed during chunked body");
                     chunked_data += chunk;
                 }
@@ -2269,7 +2320,7 @@ namespace ssock::http {
             } else {
                 body = std::move(raw);
                 while (body.size() < content_length) {
-                    std::string chunk = sock.recv(this->timeout, 1024);
+                    std::string chunk = sock.recv(this->timeout, 8192);
                     if (chunk.empty()) throw std::runtime_error("connection closed during body");
                     body += chunk;
                 }
@@ -2503,6 +2554,8 @@ namespace ssock::http {
             std::string domain{};
             std::string same_site{"Strict"};
             std::vector<std::string> attributes{};
+            bool http_only{false};
+            bool secure{false};
             std::unordered_map<std::string, std::string> extra_attributes{};
         };
 
@@ -2527,10 +2580,12 @@ namespace ssock::http {
             bool enable_session{true};
             std::string session_directory{"./"};
             std::string session_cookie_name{"session_id"};
+            std::vector<std::string> associated_session_cookies{};
             int64_t max_request_size{1024 * 1024 * 1024};
             std::vector<std::string> blacklisted_ips{};
             bool trust_x_forwarded_for{false};
             int max_connections{-1};
+            bool session_is_secure{true};
         };
 
         /**
@@ -2548,6 +2603,7 @@ namespace ssock::http {
             unsigned int version{};
             std::vector<cookie> cookies{};
             std::unordered_map<std::string, std::string> session{};
+            std::string session_id{};
             std::unordered_map<std::string, std::string> fields{};
         };
 
@@ -2560,6 +2616,7 @@ namespace ssock::http {
             std::string content_type{"application/json"};
             std::string allow_origin{"*"};
             bool stop{false};
+            bool close{true};
             std::vector<cookie> cookies{};
             std::vector<std::string> delete_cookies{};
             std::unordered_map<std::string, std::string> session{};
@@ -2667,7 +2724,6 @@ namespace ssock::http {
 
                     request req{};
                     std::string raw{};
-                    std::string body{};
                     std::string headers = client_sock->recv(5, "\r\n\r\n");
                     if (headers.empty()) {
                         continue;
@@ -2692,9 +2748,9 @@ namespace ssock::http {
                     }
 
                     if (is_chunked) {
-                        std::string chunked; // start empty or with any leftover body if applicable
+                        std::string chunked;
                         while (chunked.find("0\r\n\r\n") == std::string::npos) {
-                            std::string chunk = client_sock->recv(5, 1024);
+                            std::string chunk = client_sock->recv(5, 8192);
                             if (chunk.empty()) {
                                 break;
                             }
@@ -2708,7 +2764,7 @@ namespace ssock::http {
                         std::string body;
                         while (body.size() < content_length) {
                             size_t to_read = content_length - body.size();
-                            std::string chunk = client_sock->recv(30, std::min(to_read, static_cast<size_t>(1024)));
+                            std::string chunk = client_sock->recv(30, std::min(to_read, static_cast<size_t>(8192)));
                             if (chunk.empty()) {
                                 break;
                             }
@@ -2796,10 +2852,39 @@ namespace ssock::http {
                         }
                     }
 
+                    bool erase_associated = false;
                     if (session_id_found) {
                         std::erase(session_id, '/');
                         std::filesystem::path session_file = settings.session_directory + "/session_" + session_id + ".txt";
                         req.session = read_from_session_file(session_file);
+                        req.session_id = session_id;
+
+                        if (!std::filesystem::exists(session_file)) {
+                            erase_associated = true;
+                            // remove associated session cookies and session cookie from request
+                            for (const auto& it : settings.associated_session_cookies) {
+                                req.cookies.erase(
+                                    std::remove_if(req.cookies.begin(), req.cookies.end(),
+                                                   [&it](const cookie& cookie) {
+                                                       return cookie.name == it;
+                                                   }),
+                                    req.cookies.end()
+                                );
+                            }
+                            req.cookies.erase(
+                                std::remove_if(req.cookies.begin(), req.cookies.end(),
+                                               [this, &settings](const cookie& cookie) {
+                                                   return cookie.name == settings.session_cookie_name;
+                                               }),
+                                req.cookies.end()
+                            );
+
+                            req.session.clear();
+                            req.session_id.clear();
+                        } else {
+                            req.session = read_from_session_file(session_file);
+                            req.session_id = session_id;
+                        }
                     }
 
                     auto response = callback(req);
@@ -2826,7 +2911,7 @@ namespace ssock::http {
 
                     if (!session_id_found && settings.enable_session) {
                         session_id = utility::generate_random_string();
-                        response.cookies.push_back({settings.session_cookie_name, session_id, 0, "/", .same_site = "Strict"});
+                        response.cookies.push_back({settings.session_cookie_name, session_id, 0, "/", .same_site = "Strict", .http_only = true, .secure = settings.session_is_secure});
                     } else if (settings.enable_session) {
                         std::string session_file = settings.session_directory + "/session_" + session_id + ".txt";
                         std::unordered_map<std::string, std::string> stored = read_from_session_file(session_file);
@@ -2845,13 +2930,19 @@ namespace ssock::http {
                         } else {
                             cookie_str += "Expires=session; ";
                         }
+                        if (it.http_only) {
+                            cookie_str += "HttpOnly; ";
+                        }
+                        if (it.secure) {
+                            cookie_str += "Secure; ";
+                        }
                         if (!it.path.empty()) {
                             cookie_str += "Path=" + it.path + "; ";
                         }
                         if (!it.domain.empty()) {
                             cookie_str += "Domain=" + it.domain + "; ";
                         }
-                        if (!it.same_site.empty() && (it.same_site == "Strict" || it.same_site == "Lax")) {
+                        if (!it.same_site.empty() && (it.same_site == "Strict" || it.same_site == "Lax" || it.same_site == "None")) {
                             cookie_str += "SameSite=" + it.same_site + "; ";
                         }
                         for (const auto& attribute : it.attributes) {
@@ -2862,6 +2953,12 @@ namespace ssock::http {
                         }
 
                         net_response << "Set-Cookie: " << cookie_str << "\r\n";
+                    }
+
+                    if (erase_associated) {
+                        for (const auto& it : settings.associated_session_cookies) {
+                            response.delete_cookies.push_back(it);
+                        }
                     }
 
                     for (const auto& it : response.delete_cookies) {
@@ -2877,7 +2974,10 @@ namespace ssock::http {
                         net_response << it.name << ": " << it.data << "\r\n";
                     }
 
-                    net_response << "Connection: close\r\n";
+                    if (response.close) {
+                        net_response << "Connection: close\r\n";
+                    }
+
                     net_response << "\r\n";
                     net_response << response.body;
 
