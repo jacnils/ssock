@@ -3113,7 +3113,7 @@ namespace ssock::http {
                         req.session.clear();
                         req.session_id.clear();
                     } else {
-                        req.session = read_from_session_file(session_file);
+                        req.session = read_from_session_file(session_file.string());
                         req.session_id = session_id;
                     }
                 }
