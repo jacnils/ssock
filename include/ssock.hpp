@@ -15,6 +15,8 @@
 #include <variant>
 #include <algorithm>
 #include <ranges>
+#include <functional>
+#include <random>
 
 #ifndef SSOCK
 #define SSOCK 1
@@ -155,6 +157,185 @@ namespace ssock {
         explicit dns_error(const char* message) : message(message) {}
         explicit dns_error(const std::string& string) : message(string.c_str()) {};
     };
+}
+
+/**
+ * @brief Namespace for utility functions and classes.
+ * @note Contains helper functions and classes that are not directly related to networking.
+ */
+namespace ssock::utility {
+    /**
+     * @brief Splits a string into tokens based on a delimiter.
+     * @param str The string to split.
+     * @param delimiter The delimiter to use for splitting.
+     * @return A vector of strings containing the tokens.
+     */
+    [[nodiscard]] inline std::vector<std::string> split(const std::string& str, const std::string& delimiter) {
+        std::vector<std::string> tokens;
+        size_t start = 0;
+        size_t end = str.find(delimiter);
+        while (end != std::string::npos) {
+            tokens.push_back(str.substr(start, end - start));
+            start = end + delimiter.length();
+            end = str.find(delimiter, start);
+        }
+        tokens.push_back(str.substr(start, end));
+        return tokens;
+    }
+
+    /**
+     * @brief Joins a vector of strings into a single string with a delimiter.
+     * @param tokens The vector of strings to join.
+     * @param delimiter The delimiter to use for joining.
+     * @return A single string containing the joined tokens.
+     */
+    [[nodiscard]] inline std::string join(const std::vector<std::string>& tokens, const std::string& delimiter) {
+        if (tokens.empty()) return "";
+        std::ostringstream oss;
+        std::copy(tokens.begin(), tokens.end() - 1, std::ostream_iterator<std::string>(oss, delimiter.c_str()));
+        oss << tokens.back();
+        return oss.str();
+    }
+    /**
+     * @brief Generates a random alphanumeric string of a given length.
+     * @param length The length of the random string to generate.
+     * @return A random alphanumeric string.
+     */
+    [[nodiscard]] static std::string generate_random_string(const std::size_t length = 64) {
+        static constexpr char charset[] =
+            "0123456789"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz";
+
+        static constexpr size_t charset_size = sizeof(charset) - 1;
+        std::random_device rd;
+
+        std::string result;
+        result.reserve(length);
+
+        for (std::size_t i = 0; i < length; ++i) {
+            result += charset[rd() % charset_size];
+        }
+
+        return result;
+    }
+    /**
+     * @brief URL-encodes a string.
+     * @param str The string to encode.
+     * @return The URL-encoded string.
+     */
+    static std::string url_encode(const std::string& str) {
+        std::string ret;
+        for (int i = 0; i < str.length(); i++) {
+            char ch = str[i];
+            if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+                ret += ch;
+            } else if (ch == ' ') {
+                ret += '+';
+            } else {
+                ret += '%';
+                ret += "0123456789ABCDEF"[ch >> 4];
+                ret += "0123456789ABCDEF"[ch & 15];
+            }
+        }
+        return ret;
+    }
+    /**
+     * @brief URL-decodes a string.
+     * @param str The string to decode.
+     * @return The URL-decoded string.
+     */
+    static std::string url_decode(const std::string& str) {
+        std::string result;
+        result.reserve(str.size());
+
+        for (std::size_t i = 0; i < str.length(); ++i) {
+            if (str[i] == '%') {
+                if (i + 2 < str.length()) {
+                    char hex1 = str[i + 1];
+                    char hex2 = str[i + 2];
+
+                    if (std::isxdigit(hex1) && std::isxdigit(hex2)) {
+                        int high = std::isdigit(hex1) ? hex1 - '0' : std::tolower(hex1) - 'a' + 10;
+                        int low  = std::isdigit(hex2) ? hex2 - '0' : std::tolower(hex2) - 'a' + 10;
+                        result += static_cast<char>((high << 4) | low);
+                        i += 2;
+                        continue;
+                    }
+                }
+                result += '%';
+            } else if (str[i] == '+') {
+                result += ' ';
+            } else {
+                result += str[i];
+            }
+        }
+
+        return result;
+    }
+    static std::unordered_map<std::string, std::string> parse_fields(const std::string& body) {
+        std::unordered_map<std::string, std::string> result;
+
+        std::size_t start = 0;
+        while (start < body.length()) {
+            std::size_t end = body.find('&', start);
+            if (end == std::string::npos) end = body.length();
+
+            std::string pair = body.substr(start, end - start);
+            std::size_t eq_pos = pair.find('=');
+
+            if (eq_pos != std::string::npos) {
+                std::string key = url_decode(pair.substr(0, eq_pos));
+                std::string value = url_decode(pair.substr(eq_pos + 1));
+                result[std::move(key)] = std::move(value);
+            } else if (!pair.empty()) {
+                std::string key = url_decode(pair);
+                result[std::move(key)] = "";
+            }
+
+            start = end + 1;
+        }
+
+        return result;
+    }
+    inline std::string convert_unix_millis_to_gmt(const int64_t unix_millis) {
+        if (unix_millis == -1) {
+            return "Thu, 01 Jan 1970 00:00:00 GMT";
+        }
+
+        std::time_t time = unix_millis / 1000;
+        std::tm* tm = std::gmtime(&time);
+        char buffer[80];
+        std::strftime(buffer, 80, "%a, %d %b %Y %H:%M:%S GMT", tm);
+        return {(buffer)};
+    }
+    [[nodiscard]] inline std::string decode_chunked(const std::string& encoded) {
+        std::string dec;
+        size_t pos = 0;
+
+        while (pos < encoded.size()) {
+            size_t crlf = encoded.find("\r\n", pos);
+            if (crlf == std::string::npos) break;
+
+            std::string size_str = encoded.substr(pos, crlf - pos);
+            size_t chunk_size = 0;
+            try {
+                chunk_size = std::stoul(size_str, nullptr, 16);
+            } catch (...) {
+                break;
+            }
+
+            if (chunk_size == 0) break;
+
+            pos = crlf + 2;
+            if (pos + chunk_size > encoded.size()) break;
+
+            dec.append(encoded.substr(pos, chunk_size));
+            pos += chunk_size + 2;
+        }
+
+        return dec;
+    }
 }
 
 /**
@@ -405,6 +586,9 @@ namespace ssock::network {
             std::string hostname{};
 
             void throw_if_invalid() const {
+                if (hostname == "localhost") {
+                    return;
+                }
                 if (hostname.empty()) {
                     throw parsing_error("dns_resolver(): hostname cannot be empty");
                 }
@@ -1158,11 +1342,14 @@ namespace ssock::sock {
         virtual void bind() = 0;
         virtual void unbind() = 0;
         virtual void listen(int backlog) = 0;
+        virtual void listen() = 0;
         virtual std::unique_ptr<sync_sock> accept() = 0;
         virtual int send(const void* buf, size_t len) = 0;
         virtual void send(const std::string& buf) = 0;
         [[nodiscard]] virtual std::string recv(int timeout_seconds) const = 0;
         [[nodiscard]] virtual std::string recv(int timeout_seconds, const std::string& match) const = 0;
+        [[nodiscard]] virtual std::string recv(int timeout_seconds, const std::string& match, size_t eof) const = 0;
+        [[nodiscard]] virtual std::string recv(int timeout_seconds, size_t eof) const = 0;
         virtual void close() = 0;
     };
 
@@ -1376,24 +1563,31 @@ namespace ssock::sock {
 #endif
         /**
          * @brief Listen for incoming connections.
-         * @param backlog The maximum number of pending connections (default is 5).
+         * @param backlog The maximum number of pending connections.
          * @note Very barebones, use with care.
          */
 #ifdef SSOCK_UNIX
         void listen(int backlog) override {
-            if (internal_net::sys_net_listen(this->sockfd, backlog) < 0) {
+            if (internal_net::sys_net_listen(this->sockfd, backlog == -1 ? SOMAXCONN : backlog) < 0) {
                 throw socket_error("failed to listen on socket");
             }
         }
 #endif
 #ifdef SSOCK_WINDOWS
         void listen(int backlog) override {
-            if (::listen(this->sockfd, backlog) == SOCKET_ERROR) {
+            if (::listen(this->sockfd, backlog == -1 ? SOMAXCONN : backlog) == SOCKET_ERROR) {
                 int err = WSAGetLastError();
                 throw socket_error("failed to listen socket, error code: " + std::to_string(err));
             }
         }
 #endif
+        /**
+         * @brief Listen for incoming connections with default backlog.
+         * @note Uses SOMAXCONN as the default backlog value.
+         */
+        void listen() override {
+            listen(-1);
+        }
         /**
          * @brief Accept a connection from a client.
          * @return sock_handle The socket handle for the accepted connection.
@@ -1466,10 +1660,11 @@ namespace ssock::sock {
          * @brief Receive data from the server.
          * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely until match is found)
          * @param match The substring to look for in received data.
+         * @param eof The number of bytes to read before considering the match complete.
          * @return The received data as a string.
          */
 #ifdef SSOCK_UNIX
-        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
+        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
             std::string data;
             auto start = std::chrono::steady_clock::now();
 
@@ -1509,6 +1704,9 @@ namespace ssock::sock {
                         break;
                     }
                     data.append(buf, received);
+                    if (data.length() >= eof && eof != 0) {
+                        break;
+                    }
 
                     if (data.find_last_of(match) != std::string::npos && !match.empty()) {
                         break;
@@ -1566,6 +1764,9 @@ namespace ssock::sock {
                     }
 
                     data.append(buf, received);
+                    if (data.length() >= eof && eof != 0) {
+                        break;
+                    }
 
                     if (!match.empty() && data.find_last_of(match) != std::string::npos) {
                         break;
@@ -1581,7 +1782,25 @@ namespace ssock::sock {
          * @return The received data as a string.
          */
         [[nodiscard]] std::string recv(const int timeout_seconds) const override {
-            return recv(timeout_seconds, "");
+            return recv(timeout_seconds, "", 0);
+        }
+        /**
+         * @brief Receive data from the server until a specific match is found.
+         * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
+         * @param match The substring to look for in received data.
+         * @return The received data as a string.
+         */
+        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
+            return recv(timeout_seconds, match, 0);
+        }
+        /**
+         * @brief Receive data from the server until a specific match is found or a certain amount of data is received.
+         * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
+         * @param eof The number of bytes to read before considering the match complete.
+         * @return The received data as a string.
+         */
+        [[nodiscard]] std::string recv(const int timeout_seconds, size_t eof) const override {
+            return recv(timeout_seconds, "", eof);
         }
 
         /**
@@ -1747,12 +1966,110 @@ namespace ssock::http {
         POST,
     };
 
+    struct http_status_code {
+        int code;
+        std::string_view message;
+    };
+
+    static constexpr std::array<http_status_code, 63> http_status_list = {{
+        {100, "Continue"},
+        {101, "Switching Protocols"},
+        {102, "Processing"},
+        {103, "Early Hints"},
+        {200, "OK"},
+        {201, "Created"},
+        {202, "Accepted"},
+        {203, "Non-Authoritative Information"},
+        {204, "No Content"},
+        {205, "Reset Content"},
+        {206, "Partial Content"},
+        {207, "Multi-Status"},
+        {208, "Already Reported"},
+        {226, "IM Used"},
+        {300, "Multiple Choices"},
+        {301, "Moved Permanently"},
+        {302, "Found"},
+        {303, "See Other"},
+        {304, "Not Modified"},
+        {305, "Use Proxy"},
+        {306, "Switch Proxy"},
+        {307, "Temporary Redirect"},
+        {308, "Permanent Redirect"},
+        {400, "Bad Request"},
+        {401, "Unauthorized"},
+        {402, "Payment Required"},
+        {403, "Forbidden"},
+        {404, "Not Found"},
+        {405, "Method Not Allowed"},
+        {406, "Not Acceptable"},
+        {407, "Proxy Authentication Required"},
+        {408, "Request Timeout"},
+        {409, "Conflict"},
+        {410, "Gone"},
+        {411, "Length Required"},
+        {412, "Precondition Failed"},
+        {413, "Content Too Large"},
+        {414, "URI Too Long"},
+        {415, "Unsupported Media Type"},
+        {416, "Range Not Satisfiable"},
+        {417, "Expectation Failed"},
+        {418, "I'm a teapot"},
+        {421, "Misdirected Request"},
+        {422, "Unprocessable Content"},
+        {423, "Locked"},
+        {424, "Failed Dependency"},
+        {425, "Too Early"},
+        {426, "Upgrade Required"},
+        {428, "Precondition Required"},
+        {429, "Too Many Requests"},
+        {431, "Request Header Fields Too Large"},
+        {451, "Unavailable For Legal Reasons"},
+        {500, "Internal Server Error"},
+        {501, "Not Implemented"},
+        {502, "Bad Gateway"},
+        {503, "Service Unavailable"},
+        {504, "Gateway Timeout"},
+        {505, "HTTP Version Not Supported"},
+        {506, "Variant Also Negotiates"},
+        {507, "Insufficient Storage"},
+        {508, "Loop Detected"},
+        {510, "Not Extended"},
+        {511, "Network Authentication Required"}
+    }};
+
+    constexpr std::optional<std::string_view> get_http_message(int code) {
+        for (const auto& status : http_status_list) {
+            if (status.code == code)
+                return status.message;
+        }
+        return std::nullopt;
+    }
+
+    constexpr const std::array<http_status_code, http_status_list.size()>& get_http_status_codes() {
+        return http_status_list;
+    }
+
+    /**
+     * @brief A struct that represents an HTTP status line.
+     * @note Used to parse the status line of an HTTP response.
+     */
+    struct http_status_line {
+        bool is_response{false};
+        int status_code{-1};
+        std::string method;
+        std::string path;
+        std::string version;
+    };
+
     /**
      * @brief A struct that represents an HTTP response.
      */
     struct response {
         int status_code{};
         std::string body{};
+        std::string method{};
+        http_status_line status_line{};
+
         std::vector<std::pair<std::string, std::string>> headers{};
     };
 
@@ -1769,8 +2086,7 @@ namespace ssock::http {
         virtual VPS& get_headers() = 0;
         virtual T& get_body() = 0;
         virtual T& get_input() = 0;
-        virtual T decode_chunked(const std::string& encoded) = 0;
-        virtual int get_status_code() = 0;
+        virtual http_status_line get_status_line() = 0;
         virtual R& parse() = 0;
     };
 
@@ -1786,6 +2102,7 @@ namespace ssock::http {
         R ret{};
         VPS headers{};
         T body{};
+        http_status_line status_line{};
     public:
         /**
          * @brief Constructs a basic_body_parser object.
@@ -1820,76 +2137,41 @@ namespace ssock::http {
             }
         }
         ~body_parser() override = default;
-
         /**
-         * @brief Decode chunked transfer encoding.
-         * @param encoded The encoded string.
-         * @return The decoded string.
+         * @brief Parse the status line from the input.
+         * @return The parsed http_status_line object.
          */
-        [[nodiscard]] T decode_chunked(const std::string& encoded) override {
-            T dec;
-            size_t pos = 0;
+        http_status_line get_status_line() override {
+            size_t newline_pos = input.find('\n');
+            std::string line = (newline_pos != std::string::npos) ? input.substr(0, newline_pos) : input;
 
-            while (pos < encoded.size()) {
-                size_t crlf = encoded.find("\r\n", pos);
-                if (crlf == std::string::npos) break;
-
-                std::string size_str = encoded.substr(pos, crlf - pos);
-                size_t chunk_size = 0;
-                try {
-                    chunk_size = std::stoul(size_str, nullptr, 16);
-                } catch (...) {
-                    break;
-                }
-
-                if (chunk_size == 0) break;
-
-                pos = crlf + 2;
-                if (pos + chunk_size > encoded.size()) break;
-
-                dec.append(encoded.substr(pos, chunk_size));
-                pos += chunk_size + 2;
-            }
-
-            return dec;
-        }
-        /**
-         * @brief Get the status code from the response.
-         * @return The status code.
-         */
-        [[nodiscard]] int get_status_code() override {
-            if (input.find("HTTP/") == std::string::npos) {
-                throw parsing_error("failed to parse status code");
-            }
-            std::string line{};
-            if (input.find('\n') != std::string::npos) {
-                line = input.substr(0, input.find('\n'));
-            } else {
-                line = input;
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
             }
 
             if (line.empty()) {
-                throw parsing_error("failed to parse status code");
+                throw parsing_error("empty HTTP start line");
             }
-
-            if (line.back() == '\r') line.pop_back();
 
             std::istringstream iss(line);
-            std::string version{};
 
-            int status_code{};
+            http_status_line msg;
 
-            iss >> version >> status_code;
-
-            if (iss.fail()) {
-                throw parsing_error("failed to parse status code");
+            if (line.compare(0, 5, "HTTP/") == 0) {
+                msg.is_response = true;
+                iss >> msg.version >> msg.status_code;
+                if (iss.fail() || msg.status_code < 100 || msg.status_code > 599) {
+                    throw parsing_error("invalid HTTP response status line");
+                }
+            } else {
+                iss >> msg.method >> msg.path >> msg.version;
+                if (iss.fail()) {
+                    throw parsing_error("invalid HTTP request start line");
+                }
+                msg.is_response = false;
             }
 
-            if (status_code < 100 || status_code > 599) {
-                throw parsing_error("invalid status code");
-            }
-
-            return status_code;
+            return msg;
         }
         /**
          * @brief Get the input stream.
@@ -1917,23 +2199,10 @@ namespace ssock::http {
          */
         [[nodiscard]] R& parse() override {
             this->ret = R{};
-            this->ret.status_code = get_status_code();
+            this->ret.status_line = get_status_line();
             this->ret.headers = get_headers();
             this->ret.body = get_body();
-
-            // handle chunked
-            bool is_enc{false};
-            for (const auto& [key, val] : ret.headers) {
-                if (key == "Transfer-Encoding" && val.find("chunked") != std::string::npos) {
-                    ret.body = std::move(decode_chunked(input));
-                    is_enc = true;
-                    break;
-                }
-            }
-
-            if (!is_enc) {
-                ret.body = input;
-            }
+            this->ret.body = input;
 
             return ret;
         }
@@ -1953,14 +2222,60 @@ namespace ssock::http {
         std::string version_str{};
         std::vector<std::pair<std::string,std::string>> headers{};
         std::string body{};
-        int timeout{-1};
+        int timeout{5};
 
-        [[nodiscard]] std::string make_request(const std::string& request) const noexcept {
+        [[nodiscard]] std::string make_request(const std::string& request) const {
             sock::sock_addr addr(hostname, port, sock::sock_addr_type::hostname_ipv4);
             sock::sync_sock sock(addr, sock::sock_type::tcp);
             sock.connect();
             sock.send(request);
-            return sock.recv(this->timeout, "\r\n\r\n");
+
+            std::string raw;
+            std::string headers;
+            while (true) {
+                std::string chunk = sock.recv(this->timeout, 1024);
+                if (chunk.empty()) throw std::runtime_error("connection closed during headers");
+                raw += chunk;
+                if (auto pos = raw.find("\r\n\r\n"); pos != std::string::npos) {
+                    headers = raw.substr(0, pos + 4);
+                    raw = raw.substr(pos + 4);
+                    break;
+                }
+            }
+
+            bool is_chunked = false;
+            std::size_t content_length = 0;
+
+            std::istringstream header_stream(headers);
+            std::string line;
+            while (std::getline(header_stream, line) && line != "\r") {
+                if (line.starts_with("Transfer-Encoding:") && line.find("chunked") != std::string::npos) {
+                    is_chunked = true;
+                } else if (line.starts_with("Content-Length:")) {
+                    content_length = std::stoul(line.substr(15));
+                }
+            }
+
+            std::string body;
+
+            if (is_chunked) {
+                std::string chunked_data = std::move(raw);
+                while (chunked_data.find("0\r\n\r\n") == std::string::npos) {
+                    std::string chunk = sock.recv(this->timeout, 1024);
+                    if (chunk.empty()) throw std::runtime_error("connection closed during chunked body");
+                    chunked_data += chunk;
+                }
+                body = utility::decode_chunked(chunked_data);
+            } else {
+                body = std::move(raw);
+                while (body.size() < content_length) {
+                    std::string chunk = sock.recv(this->timeout, 1024);
+                    if (chunk.empty()) throw std::runtime_error("connection closed during body");
+                    body += chunk;
+                }
+            }
+
+            return headers + body;
         }
     public:
         /**
@@ -2175,4 +2490,401 @@ namespace ssock::http {
             return parser.parse();
         }
     };
+
+    namespace server {
+        /**
+         * @brief  Struct that represents a cookie.
+         */
+        struct cookie {
+            std::string name{};
+            std::string value{};
+            int64_t expires{};
+            std::string path{"/"};
+            std::string domain{};
+            std::string same_site{"Strict"};
+            std::vector<std::string> attributes{};
+            std::unordered_map<std::string, std::string> extra_attributes{};
+        };
+
+        /**
+         * @brief  Struct that represents an HTTP header.
+         */
+        struct header {
+            std::string name{};
+            std::string data{};
+        };
+
+        enum class redirect_type {
+            permanent,
+            temporary,
+        };
+
+        /**
+         * @brief  Struct that contains the server settings.
+         */
+        struct server_settings {
+            int port{8080};
+            bool enable_session{true};
+            std::string session_directory{"./"};
+            std::string session_cookie_name{"session_id"};
+            int64_t max_request_size{1024 * 1024 * 1024};
+            std::vector<std::string> blacklisted_ips{};
+            bool trust_x_forwarded_for{false};
+            int max_connections{-1};
+        };
+
+        /**
+         * @brief  Struct that contains the request data.
+         */
+        struct request {
+            std::string endpoint{};
+            std::unordered_map<std::string, std::string> query{};
+            std::string content_type{};
+            std::string body{};
+            std::string raw_body{};
+            std::string method{};
+            std::string ip_address{};
+            std::string user_agent{};
+            unsigned int version{};
+            std::vector<cookie> cookies{};
+            std::unordered_map<std::string, std::string> session{};
+            std::unordered_map<std::string, std::string> fields{};
+        };
+
+        /**
+         * @brief  Struct that contains the response data.
+         */
+        struct response {
+            int http_status{200};
+            std::string body{};
+            std::string content_type{"application/json"};
+            std::string allow_origin{"*"};
+            bool stop{false};
+            std::vector<cookie> cookies{};
+            std::vector<std::string> delete_cookies{};
+            std::unordered_map<std::string, std::string> session{};
+            std::string location{};
+            redirect_type redirect_type{redirect_type::temporary};
+            std::vector<header> headers{};
+        };
+
+        /**
+         * @brief  Class that represents a server.
+         */
+        template <typename T = http::body_parser<std::string>>
+        class sync_server {
+            static std::vector<cookie> get_cookies_from_request(const std::string& cookie_header) {
+                std::vector<cookie> cookies;
+                std::string cookie_str = cookie_header + ";";
+
+                while (cookie_str.find(';') != std::string::npos) {
+                    std::string cookie = cookie_str.substr(0, cookie_str.find(';'));
+                    cookie_str = cookie_str.substr(cookie_str.find(';') + 1);
+
+                    std::string name = cookie.substr(0, cookie.find('='));
+                    std::string value = cookie.substr(cookie.find('=') + 1);
+
+                    if (!name.empty() && !value.empty()) {
+                        if (name.front() == ' ') {
+                            name = name.substr(1);
+                        }
+                        cookies.push_back({name, value});
+                    }
+                }
+
+                return cookies;
+            }
+
+            static std::unordered_map<std::string, std::string> read_from_session_file(const std::string& f) {
+                std::unordered_map<std::string, std::string> session;
+
+                std::ifstream file(f);
+
+                if (!file.good()) {
+                    file.close();
+                    return {};
+                }
+
+                if (!file.is_open()) {
+                    throw std::runtime_error("failed to open session file (read_from_session_file()): " + f);
+                }
+
+                std::string line{};
+                while (std::getline(file, line)) {
+                    if (line.find('=') != std::string::npos) {
+                        std::string key = line.substr(0, line.find('='));
+                        std::string value = line.substr(line.find('=') + 1);
+
+                        session[key] = value;
+                    }
+                }
+
+                file.close();
+
+                return session;
+            }
+
+            static void write_to_session_file(const std::string& f, const std::unordered_map<std::string, std::string>& session) {
+                auto directory = std::filesystem::path(f).parent_path();
+                if (!std::filesystem::exists(directory)) {
+                    std::filesystem::create_directories(directory);
+                }
+                std::ofstream file(f, std::ios::trunc);
+
+                if (!file.is_open() || !file.good()) {
+                    throw std::runtime_error("failed to open session file (write_to_session_file()): " + f);
+                }
+
+                for (const auto& it : session) {
+                    file << it.first << "=" << it.second << "\n";
+                }
+
+                file.close();
+            }
+        public:
+            /**
+             * @brief  Constructor for the server class
+             * @param  settings The settings for the server
+             * @param  callback The function to call when a request is made
+             */
+            sync_server(const server_settings& settings, const std::function<response(const request&)>& callback) {
+                if (!ssock::network::is_valid_port(settings.port)) {
+                    throw parsing_error("invalid port");
+                }
+
+                sock::sock_addr addr = {"localhost", settings.port, ssock::sock::sock_addr_type::hostname};
+                sock::sync_sock sock(addr, ssock::sock::sock_type::tcp, ssock::sock::sock_opt::reuse_addr);
+
+                sock.bind();
+                sock.listen(settings.max_connections);
+
+                while (true) {
+                    auto client_sock = sock.accept();
+
+                    if (!client_sock) {
+                        continue;
+                    }
+
+                    request req{};
+                    std::string raw{};
+                    std::string body{};
+                    std::string headers = client_sock->recv(5, "\r\n\r\n");
+                    if (headers.empty()) {
+                        continue;
+                    }
+                    raw += headers;
+
+                    bool is_chunked = false;
+                    std::size_t content_length = 0;
+
+                    std::istringstream header_stream(headers);
+                    std::string line;
+                    while (std::getline(header_stream, line) && line != "\r") {
+                        if (line.starts_with("Transfer-Encoding:") && line.find("chunked") != std::string::npos) {
+                            is_chunked = true;
+                        } else if (line.starts_with("Content-Length:")) {
+                            try {
+                                content_length = std::stoul(line.substr(15));
+                            } catch (...) {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (is_chunked) {
+                        std::string chunked; // start empty or with any leftover body if applicable
+                        while (chunked.find("0\r\n\r\n") == std::string::npos) {
+                            std::string chunk = client_sock->recv(5, 1024);
+                            if (chunk.empty()) {
+                                break;
+                            }
+                            chunked += chunk;
+                        }
+
+                        std::string decoded = utility::decode_chunked(chunked);
+                        raw = headers + decoded;
+                        req.raw_body = raw;
+                    } else {
+                        std::string body;
+                        while (body.size() < content_length) {
+                            size_t to_read = content_length - body.size();
+                            std::string chunk = client_sock->recv(30, std::min(to_read, static_cast<size_t>(1024)));
+                            if (chunk.empty()) {
+                                break;
+                            }
+                            body += chunk;
+                        }
+
+                        req.raw_body = headers + body;
+                    }
+
+                    if (req.raw_body.empty() || req.raw_body.size() > settings.max_request_size) {
+                        continue;
+                    }
+
+                    auto parsed = T(req.raw_body).parse();
+                    req.ip_address = [&]() -> std::string {
+                        if (settings.trust_x_forwarded_for) {
+                            for (const auto& it : parsed.headers) {
+                                if (it.first == "X-Forwarded-For") {
+                                    auto ips = ssock::utility::split(it.second, ",");
+                                    for (const auto& ip : ips) {
+                                        if (ssock::sock::is_ipv4(ip) || ssock::sock::is_ipv6(ip)) {
+                                            return ip;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return {};
+                    }();
+
+                    if (req.ip_address.empty()) {
+                        req.ip_address = client_sock->get_peer().get_ip();
+                    }
+
+                    if (!ssock::sock::is_ipv4(req.ip_address) && !ssock::sock::is_ipv6(req.ip_address)) {
+                        throw parsing_error("invalid IP address: " + req.ip_address);
+                    }
+
+                    if (std::ranges::find(settings.blacklisted_ips, req.ip_address) != settings.blacklisted_ips.end()) {
+                        continue;
+                    }
+
+                    req.body = parsed.body;
+                    req.version = [&]() {
+                        if (parsed.status_line.version == "HTTP/1.0") {
+                            return 10;
+                        } else if (parsed.status_line.version == "HTTP/1.1") {
+                            return 11;
+                        } else {
+                            throw parsing_error("unsupported HTTP version: " + parsed.status_line.version);
+                        }
+                    }();
+                    req.method = parsed.method;
+                    auto full_path = parsed.status_line.path;
+                    if (full_path.empty() || full_path[0] != '/') {
+                        throw parsing_error("invalid path: " + full_path);
+                    }
+                    auto query_pos = full_path.find('?');
+                    if (query_pos != std::string::npos) {
+                        req.endpoint = full_path.substr(0, query_pos);
+                        auto query_str = full_path.substr(query_pos + 1);
+                        req.query = ssock::utility::parse_fields(query_str);
+                    } else {
+                        req.endpoint = full_path;
+                    }
+
+                    req.fields = ssock::utility::parse_fields(req.body);
+                    for (const auto& it : parsed.headers) {
+                        if (it.first == "Content-Type") {
+                            req.content_type = it.second;
+                        } else if (it.first == "User-Agent") {
+                            req.user_agent = it.second;
+                        } else if (it.first == "Cookie") {
+                            req.cookies = get_cookies_from_request(it.second);
+                        }
+                    }
+
+                    std::string session_id{};
+                    bool session_id_found = false;
+                    for (const auto& it : req.cookies) {
+                        if (it.name == settings.session_cookie_name && !it.value.empty() && settings.enable_session) {
+                            session_id = it.value;
+                            session_id_found = true;
+                            break;
+                        }
+                    }
+
+                    if (session_id_found) {
+                        std::erase(session_id, '/');
+                        std::filesystem::path session_file = settings.session_directory + "/session_" + session_id + ".txt";
+                        req.session = read_from_session_file(session_file);
+                    }
+
+                    auto response = callback(req);
+                    std::stringstream net_response;
+                    net_response << "HTTP/1.1 " << response.http_status << " " << ssock::http::get_http_message(response.http_status).value_or("Unknown") << "\r\n";
+                    if (!response.content_type.empty()) net_response << "Content-Type: " << response.content_type << "\r\n";
+                    if (!response.allow_origin.empty()) net_response << "Access-Control-Allow-Origin: " << response.allow_origin << "\r\n";
+                    if (!response.body.empty()) {
+                        net_response << "Content-Length: " << response.body.size() << "\r\n";
+                    }
+                    if (!response.location.empty()) {
+                        net_response << "Location: " << response.location << "\r\n";
+                    }
+                    if (!response.headers.empty()) {
+                        for (const auto& it : response.headers) {
+                            net_response << it.name << ": " << it.data << "\r\n";
+                        }
+                    }
+                    if (response.redirect_type == redirect_type::temporary) {
+                        net_response << "Cache-Control: no-cache\r\n";
+                    } else if (response.redirect_type == redirect_type::permanent) {
+                        net_response << "Cache-Control: no-store\r\n";
+                    }
+
+                    if (!session_id_found && settings.enable_session) {
+                        session_id = utility::generate_random_string();
+                        response.cookies.push_back({settings.session_cookie_name, session_id, 0, "/", .same_site = "Strict"});
+                    } else if (settings.enable_session) {
+                        std::string session_file = settings.session_directory + "/session_" + session_id + ".txt";
+                        std::unordered_map<std::string, std::string> stored = read_from_session_file(session_file);
+
+                        for (const auto& it : response.session) {
+                            stored[it.first] = it.second;
+                        }
+
+                        write_to_session_file(session_file, stored);
+                    }
+
+                    for (const auto& it : response.cookies) {
+                        std::string cookie_str = it.name + "=" + it.value + "; ";
+                        if (it.expires != 0) {
+                            cookie_str += "Expires=" + utility::convert_unix_millis_to_gmt(it.expires) + "; ";
+                        } else {
+                            cookie_str += "Expires=session; ";
+                        }
+                        if (!it.path.empty()) {
+                            cookie_str += "Path=" + it.path + "; ";
+                        }
+                        if (!it.domain.empty()) {
+                            cookie_str += "Domain=" + it.domain + "; ";
+                        }
+                        if (!it.same_site.empty() && (it.same_site == "Strict" || it.same_site == "Lax")) {
+                            cookie_str += "SameSite=" + it.same_site + "; ";
+                        }
+                        for (const auto& attribute : it.attributes) {
+                            cookie_str += attribute + "; ";
+                        }
+                        for (const auto& attribute : it.extra_attributes) {
+                            cookie_str += attribute.first + "=" + attribute.second + "; ";
+                        }
+
+                        net_response << "Set-Cookie: " << cookie_str << "\r\n";
+                    }
+
+                    for (const auto& it : response.delete_cookies) {
+                        std::string cookie_str = it + "=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; ";
+                        net_response << "Set-Cookie: " << cookie_str << "\r\n";
+                    }
+
+                    if (response.stop) {
+                        return;
+                    }
+
+                    for (const auto& it : response.headers) {
+                        net_response << it.name << ": " << it.data << "\r\n";
+                    }
+
+                    net_response << "Connection: close\r\n";
+                    net_response << "\r\n";
+                    net_response << response.body;
+
+                    client_sock->send(net_response.str());
+                    client_sock->close();
+                }
+            }
+        };
+    }
 }
