@@ -3139,7 +3139,7 @@ namespace ssock::http {
 
                 if (!session_id_found && settings.enable_session) {
                     session_id = utility::generate_random_string();
-                    response.cookies.push_back({settings.session_cookie_name, session_id, 0, "/", .same_site = "Strict", .http_only = true, .secure = settings.session_is_secure});
+                    response.cookies.push_back({.name = settings.session_cookie_name, .value = session_id, .expires = 0, .path = "/", .same_site = "Strict", .http_only = true, .secure = settings.session_is_secure});
                 } else if (settings.enable_session) {
                     std::string session_file = settings.session_directory + "/session_" + session_id + ".txt";
                     std::unordered_map<std::string, std::string> stored = read_from_session_file(session_file);
