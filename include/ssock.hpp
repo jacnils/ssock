@@ -2990,7 +2990,7 @@ namespace ssock::http {
                     std::string body;
                     while (body.size() < content_length) {
                         size_t to_read = content_length - body.size();
-                        std::string chunk = client_sock->recv(30, std::min(to_read, static_cast<size_t>(8192)));
+                        std::string chunk = client_sock->recv(30, (std::min)(to_read, static_cast<size_t>(8192)));
                         if (chunk.empty()) {
                             break;
                         }
