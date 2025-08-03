@@ -1931,7 +1931,7 @@ namespace ssock::sock {
         }
 #endif
 #ifdef SSOCK_WINDOWS
-        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
+        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
             std::string data;
             auto start = std::chrono::steady_clock::now();
 
@@ -2798,7 +2798,7 @@ namespace ssock::http {
             std::vector<std::string> delete_cookies{};
             std::unordered_map<std::string, std::string> session{};
             std::string location{};
-            redirect_type redirect_type{redirect_type::temporary};
+            redirect_type redirection{redirect_type::temporary};
             std::vector<header> headers{};
         };
 
@@ -3131,9 +3131,9 @@ namespace ssock::http {
                         net_response << it.name << ": " << it.data << "\r\n";
                     }
                 }
-                if (response.redirect_type == redirect_type::temporary) {
+                if (response.redirection == redirect_type::temporary) {
                     net_response << "Cache-Control: no-cache\r\n";
-                } else if (response.redirect_type == redirect_type::permanent) {
+                } else if (response.redirection == redirect_type::permanent) {
                     net_response << "Cache-Control: no-store\r\n";
                 }
 
