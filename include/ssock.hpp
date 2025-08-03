@@ -9,6 +9,7 @@
 
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 #include <cstring>
 #include <unordered_map>
@@ -35,6 +36,7 @@
 #include <resolv.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
+#include <fcntl.h>
 #elif _WIN32
 #define SSOCK_WINDOWS
 #include <winsock2.h>
@@ -1181,6 +1183,8 @@ namespace ssock::sock {
         no_delay = 1 << 2, /* Disable Nagle's algorithm (TCP_NODELAY) */
         keep_alive = 1 << 3, /* Enable keep-alive option */
         no_keep_alive = 1 << 4, /* Disable keep-alive option */
+        no_blocking = 1 << 5, /* Set socket to non-blocking mode. Not necessarily supported. */
+        blocking = 1 << 6, /* Set socket to blocking mode */
     };
 
     inline sock_opt operator|(sock_opt lhs, sock_opt rhs) {
@@ -1234,7 +1238,6 @@ namespace ssock::sock {
                     return {};
                 }
             };
-
 
             if (type == sock_addr_type::hostname) {
                 ip = resolve_host(hostname, port, true);
@@ -1408,7 +1411,7 @@ namespace ssock::sock {
          * @param opts The socket options (reuse_addr, no_reuse_addr).
          */
 #ifdef SSOCK_UNIX
-        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay) : addr(addr), type(t) {
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
             if (addr.get_ip().empty()) {
                 throw socket_error("IP address is empty");
             }
@@ -1433,12 +1436,33 @@ namespace ssock::sock {
             } else if (opts & sock_opt::no_keep_alive) {
                 internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, nullptr, 0);
             }
+            if (opts & sock_opt::no_blocking) {
+                int flags = fcntl(this->sockfd, F_GETFL, 0);
+                if (flags < 0) {
+                    internal_net::sys_net_close(this->sockfd);
+                    throw socket_error("failed to get socket flags");
+                }
+                if (fcntl(this->sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                    internal_net::sys_net_close(this->sockfd);
+                    throw socket_error("failed to set socket to non-blocking mode");
+                }
+            } else if (opts & sock_opt::blocking) {
+                int flags = fcntl(this->sockfd, F_GETFL, 0);
+                if (flags < 0) {
+                    internal_net::sys_net_close(this->sockfd);
+                    throw socket_error("failed to get socket flags");
+                }
+                if (fcntl(this->sockfd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+                    internal_net::sys_net_close(this->sockfd);
+                    throw socket_error("failed to set socket to blocking mode");
+                }
+            }
 
             this->prep_sa();
         }
 #endif
 #ifdef SSOCK_WINDOWS
-        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr) : addr(addr), type(t) {
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
             if (addr.get_ip().empty()) {
                 throw socket_error("IP address is empty");
             }
@@ -1464,6 +1488,39 @@ namespace ssock::sock {
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
                     throw socket_error("Failed to clear SO_REUSEADDR");
+                }
+            }
+            if (opts & sock_opt::no_delay) {
+                BOOL optval = TRUE;
+                if (setsockopt(this->sockfd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to set TCP_NODELAY");
+                }
+            }
+            if (opts & sock_opt::keep_alive) {
+                BOOL optval = TRUE;
+                if (setsockopt(this->sockfd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to set SO_KEEPALIVE");
+                }
+            } else if (opts & sock_opt::no_keep_alive) {
+                BOOL optval = FALSE;
+                if (setsockopt(this->sockfd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to clear SO_KEEPALIVE");
+                }
+            }
+            if (opts & sock_opt::no_blocking) {
+                u_long mode = 1;
+                if (ioctlsocket(this->sockfd, FIONBIO, &mode) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to set socket to non-blocking mode");
+                }
+            } else if (opts & sock_opt::blocking) {
+                u_long mode = 0;
+                if (ioctlsocket(this->sockfd, FIONBIO, &mode) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to set socket to blocking mode");
                 }
             }
 
@@ -2698,292 +2755,309 @@ namespace ssock::http {
 
                 file.close();
             }
+
+            server_settings settings;
+            std::function<response(const request&)> callback;
+            std::unique_ptr<sock::sync_sock> sock;
         public:
             /**
              * @brief  Constructor for the server class
              * @param  settings The settings for the server
              * @param  callback The function to call when a request is made
              */
-            sync_server(const server_settings& settings, const std::function<response(const request&)>& callback) {
+            sync_server(server_settings settings, const std::function<response(const request&)>& callback)
+                : settings(std::move(settings)), callback(callback)
+            {
                 if (!ssock::network::is_valid_port(settings.port)) {
                     throw parsing_error("invalid port");
                 }
 
                 sock::sock_addr addr = {"localhost", settings.port, ssock::sock::sock_addr_type::hostname};
-                sock::sync_sock sock(addr, ssock::sock::sock_type::tcp, ssock::sock::sock_opt::reuse_addr);
+                this->sock = std::make_unique<sock::sync_sock>(addr, ssock::sock::sock_type::tcp, ssock::sock::sock_opt::reuse_addr|ssock::sock::sock_opt::no_delay|ssock::sock::sock_opt::blocking);
 
-                sock.bind();
-                sock.listen(settings.max_connections);
+                try {
+                    sock->bind();
+                } catch (const std::exception&) {
+                    throw socket_error("failed to bind socket, port might be in use");
+                }
+                sock->listen(settings.max_connections);
+            };
+            ~sync_server() {
+                sock->close();
+            }
 
-                while (true) {
-                    auto client_sock = sock.accept();
+            /**
+             * @brief  Run the server and attempt to accept an incoming connection
+             * @note Call this function in a loop to keep the server running.
+             */
+            void accept() {
+                auto client_sock = sock->accept();
 
-                    if (!client_sock) {
-                        continue;
-                    }
+                if (!client_sock) {
+                    return;
+                }
 
-                    request req{};
-                    std::string raw{};
-                    std::string headers = client_sock->recv(5, "\r\n\r\n");
-                    if (headers.empty()) {
-                        continue;
-                    }
-                    raw += headers;
+                request req{};
+                std::string raw{};
+                std::string headers = client_sock->recv(5, "\r\n\r\n");
+                if (headers.empty()) {
+                    return;
+                }
+                raw += headers;
 
-                    bool is_chunked = false;
-                    std::size_t content_length = 0;
+                bool is_chunked = false;
+                std::size_t content_length = 0;
 
-                    std::istringstream header_stream(headers);
-                    std::string line;
-                    while (std::getline(header_stream, line) && line != "\r") {
-                        if (line.starts_with("Transfer-Encoding:") && line.find("chunked") != std::string::npos) {
-                            is_chunked = true;
-                        } else if (line.starts_with("Content-Length:")) {
-                            try {
-                                content_length = std::stoul(line.substr(15));
-                            } catch (...) {
-                                break;
-                            }
+                std::istringstream header_stream(headers);
+                std::string line;
+                while (std::getline(header_stream, line) && line != "\r") {
+                    if (line.starts_with("Transfer-Encoding:") && line.find("chunked") != std::string::npos) {
+                        is_chunked = true;
+                    } else if (line.starts_with("Content-Length:")) {
+                        try {
+                            content_length = std::stoul(line.substr(15));
+                        } catch (...) {
+                            break;
                         }
                     }
+                }
 
-                    if (is_chunked) {
-                        std::string chunked;
-                        while (chunked.find("0\r\n\r\n") == std::string::npos) {
-                            std::string chunk = client_sock->recv(5, 8192);
-                            if (chunk.empty()) {
-                                break;
-                            }
-                            chunked += chunk;
+                if (is_chunked) {
+                    std::string chunked;
+                    while (chunked.find("0\r\n\r\n") == std::string::npos) {
+                        std::string chunk = client_sock->recv(5, 8192);
+                        if (chunk.empty()) {
+                            break;
                         }
-
-                        std::string decoded = utility::decode_chunked(chunked);
-                        raw = headers + decoded;
-                        req.raw_body = raw;
-                    } else {
-                        std::string body;
-                        while (body.size() < content_length) {
-                            size_t to_read = content_length - body.size();
-                            std::string chunk = client_sock->recv(30, std::min(to_read, static_cast<size_t>(8192)));
-                            if (chunk.empty()) {
-                                break;
-                            }
-                            body += chunk;
-                        }
-
-                        req.raw_body = headers + body;
+                        chunked += chunk;
                     }
 
-                    if (req.raw_body.empty() || req.raw_body.size() > settings.max_request_size) {
-                        continue;
+                    std::string decoded = utility::decode_chunked(chunked);
+                    raw = headers + decoded;
+                    req.raw_body = raw;
+                } else {
+                    std::string body;
+                    while (body.size() < content_length) {
+                        size_t to_read = content_length - body.size();
+                        std::string chunk = client_sock->recv(30, std::min(to_read, static_cast<size_t>(8192)));
+                        if (chunk.empty()) {
+                            break;
+                        }
+                        body += chunk;
                     }
 
-                    auto parsed = T(req.raw_body).parse();
-                    req.ip_address = [&]() -> std::string {
-                        if (settings.trust_x_forwarded_for) {
-                            for (const auto& it : parsed.headers) {
-                                if (it.first == "X-Forwarded-For") {
-                                    auto ips = ssock::utility::split(it.second, ",");
-                                    for (const auto& ip : ips) {
-                                        if (ssock::sock::is_ipv4(ip) || ssock::sock::is_ipv6(ip)) {
-                                            return ip;
-                                        }
+                    req.raw_body = headers + body;
+                }
+
+                if (req.raw_body.empty() || req.raw_body.size() > settings.max_request_size) {
+                    return;
+                }
+
+                auto parsed = T(req.raw_body).parse();
+                req.ip_address = [&]() -> std::string {
+                    if (settings.trust_x_forwarded_for) {
+                        for (const auto& it : parsed.headers) {
+                            if (it.first == "X-Forwarded-For") {
+                                auto ips = ssock::utility::split(it.second, ",");
+                                for (const auto& ip : ips) {
+                                    if (ssock::sock::is_ipv4(ip) || ssock::sock::is_ipv6(ip)) {
+                                        return ip;
                                     }
                                 }
                             }
                         }
-                        return {};
-                    }();
-
-                    if (req.ip_address.empty()) {
-                        req.ip_address = client_sock->get_peer().get_ip();
                     }
+                    return {};
+                }();
 
-                    if (!ssock::sock::is_ipv4(req.ip_address) && !ssock::sock::is_ipv6(req.ip_address)) {
-                        throw parsing_error("invalid IP address: " + req.ip_address);
-                    }
+                if (req.ip_address.empty()) {
+                    req.ip_address = client_sock->get_peer().get_ip();
+                }
 
-                    if (std::ranges::find(settings.blacklisted_ips, req.ip_address) != settings.blacklisted_ips.end()) {
-                        continue;
-                    }
+                if (!ssock::sock::is_ipv4(req.ip_address) && !ssock::sock::is_ipv6(req.ip_address)) {
+                    throw parsing_error("invalid IP address: " + req.ip_address);
+                }
 
-                    req.body = parsed.body;
-                    req.version = [&]() {
-                        if (parsed.status_line.version == "HTTP/1.0") {
-                            return 10;
-                        } else if (parsed.status_line.version == "HTTP/1.1") {
-                            return 11;
-                        } else {
-                            throw parsing_error("unsupported HTTP version: " + parsed.status_line.version);
-                        }
-                    }();
-                    req.method = parsed.method;
-                    auto full_path = parsed.status_line.path;
-                    if (full_path.empty() || full_path[0] != '/') {
-                        throw parsing_error("invalid path: " + full_path);
-                    }
-                    auto query_pos = full_path.find('?');
-                    if (query_pos != std::string::npos) {
-                        req.endpoint = full_path.substr(0, query_pos);
-                        auto query_str = full_path.substr(query_pos + 1);
-                        req.query = ssock::utility::parse_fields(query_str);
+                if (std::ranges::find(settings.blacklisted_ips, req.ip_address) != settings.blacklisted_ips.end()) {
+                    return;
+                }
+
+                req.body = parsed.body;
+                req.version = [&]() {
+                    if (parsed.status_line.version == "HTTP/1.0") {
+                        return 10;
+                    } else if (parsed.status_line.version == "HTTP/1.1") {
+                        return 11;
                     } else {
-                        req.endpoint = full_path;
+                        throw parsing_error("unsupported HTTP version: " + parsed.status_line.version);
                     }
+                }();
+                req.method = parsed.method;
+                auto full_path = parsed.status_line.path;
+                if (full_path.empty() || full_path[0] != '/') {
+                    throw parsing_error("invalid path: " + full_path);
+                }
+                auto query_pos = full_path.find('?');
+                if (query_pos != std::string::npos) {
+                    req.endpoint = full_path.substr(0, query_pos);
+                    auto query_str = full_path.substr(query_pos + 1);
+                    req.query = ssock::utility::parse_fields(query_str);
+                } else {
+                    req.endpoint = full_path;
+                }
 
-                    req.fields = ssock::utility::parse_fields(req.body);
-                    for (const auto& it : parsed.headers) {
-                        if (it.first == "Content-Type") {
-                            req.content_type = it.second;
-                        } else if (it.first == "User-Agent") {
-                            req.user_agent = it.second;
-                        } else if (it.first == "Cookie") {
-                            req.cookies = get_cookies_from_request(it.second);
-                        }
+                req.fields = ssock::utility::parse_fields(req.body);
+                for (const auto& it : parsed.headers) {
+                    if (it.first == "Content-Type") {
+                        req.content_type = it.second;
+                    } else if (it.first == "User-Agent") {
+                        req.user_agent = it.second;
+                    } else if (it.first == "Cookie") {
+                        req.cookies = get_cookies_from_request(it.second);
                     }
+                }
 
-                    std::string session_id{};
-                    bool session_id_found = false;
-                    for (const auto& it : req.cookies) {
-                        if (it.name == settings.session_cookie_name && !it.value.empty() && settings.enable_session) {
-                            session_id = it.value;
-                            session_id_found = true;
-                            break;
-                        }
+                std::string session_id{};
+                bool session_id_found = false;
+                for (const auto& it : req.cookies) {
+                    if (it.name == settings.session_cookie_name && !it.value.empty() && settings.enable_session) {
+                        session_id = it.value;
+                        session_id_found = true;
+                        break;
                     }
+                }
 
-                    bool erase_associated = false;
-                    if (session_id_found) {
-                        std::erase(session_id, '/');
-                        std::filesystem::path session_file = settings.session_directory + "/session_" + session_id + ".txt";
-                        req.session = read_from_session_file(session_file);
-                        req.session_id = session_id;
+                bool erase_associated = false;
+                if (session_id_found) {
+                    std::erase(session_id, '/');
+                    std::filesystem::path session_file = settings.session_directory + "/session_" + session_id + ".txt";
+                    req.session = read_from_session_file(session_file);
+                    req.session_id = session_id;
 
-                        if (!std::filesystem::exists(session_file)) {
-                            erase_associated = true;
-                            // remove associated session cookies and session cookie from request
-                            for (const auto& it : settings.associated_session_cookies) {
-                                req.cookies.erase(
-                                    std::remove_if(req.cookies.begin(), req.cookies.end(),
-                                                   [&it](const cookie& cookie) {
-                                                       return cookie.name == it;
-                                                   }),
-                                    req.cookies.end()
-                                );
-                            }
+                    if (!std::filesystem::exists(session_file)) {
+                        erase_associated = true;
+                        // remove associated session cookies and session cookie from request
+                        for (const auto& it : settings.associated_session_cookies) {
                             req.cookies.erase(
                                 std::remove_if(req.cookies.begin(), req.cookies.end(),
-                                               [this, &settings](const cookie& cookie) {
-                                                   return cookie.name == settings.session_cookie_name;
+                                               [&it](const cookie& cookie) {
+                                                   return cookie.name == it;
                                                }),
                                 req.cookies.end()
                             );
-
-                            req.session.clear();
-                            req.session_id.clear();
-                        } else {
-                            req.session = read_from_session_file(session_file);
-                            req.session_id = session_id;
                         }
+                        req.cookies.erase(
+                            std::remove_if(req.cookies.begin(), req.cookies.end(),
+                                           [this](const cookie& cookie) {
+                                               return cookie.name == settings.session_cookie_name;
+                                           }),
+                            req.cookies.end()
+                        );
+
+                        req.session.clear();
+                        req.session_id.clear();
+                    } else {
+                        req.session = read_from_session_file(session_file);
+                        req.session_id = session_id;
                     }
+                }
 
-                    auto response = callback(req);
-                    std::stringstream net_response;
-                    net_response << "HTTP/1.1 " << response.http_status << " " << ssock::http::get_http_message(response.http_status).value_or("Unknown") << "\r\n";
-                    if (!response.content_type.empty()) net_response << "Content-Type: " << response.content_type << "\r\n";
-                    if (!response.allow_origin.empty()) net_response << "Access-Control-Allow-Origin: " << response.allow_origin << "\r\n";
-                    if (!response.body.empty()) {
-                        net_response << "Content-Length: " << response.body.size() << "\r\n";
-                    }
-                    if (!response.location.empty()) {
-                        net_response << "Location: " << response.location << "\r\n";
-                    }
-                    if (!response.headers.empty()) {
-                        for (const auto& it : response.headers) {
-                            net_response << it.name << ": " << it.data << "\r\n";
-                        }
-                    }
-                    if (response.redirect_type == redirect_type::temporary) {
-                        net_response << "Cache-Control: no-cache\r\n";
-                    } else if (response.redirect_type == redirect_type::permanent) {
-                        net_response << "Cache-Control: no-store\r\n";
-                    }
-
-                    if (!session_id_found && settings.enable_session) {
-                        session_id = utility::generate_random_string();
-                        response.cookies.push_back({settings.session_cookie_name, session_id, 0, "/", .same_site = "Strict", .http_only = true, .secure = settings.session_is_secure});
-                    } else if (settings.enable_session) {
-                        std::string session_file = settings.session_directory + "/session_" + session_id + ".txt";
-                        std::unordered_map<std::string, std::string> stored = read_from_session_file(session_file);
-
-                        for (const auto& it : response.session) {
-                            stored[it.first] = it.second;
-                        }
-
-                        write_to_session_file(session_file, stored);
-                    }
-
-                    for (const auto& it : response.cookies) {
-                        std::string cookie_str = it.name + "=" + it.value + "; ";
-                        if (it.expires != 0) {
-                            cookie_str += "Expires=" + utility::convert_unix_millis_to_gmt(it.expires) + "; ";
-                        } else {
-                            cookie_str += "Expires=session; ";
-                        }
-                        if (it.http_only) {
-                            cookie_str += "HttpOnly; ";
-                        }
-                        if (it.secure) {
-                            cookie_str += "Secure; ";
-                        }
-                        if (!it.path.empty()) {
-                            cookie_str += "Path=" + it.path + "; ";
-                        }
-                        if (!it.domain.empty()) {
-                            cookie_str += "Domain=" + it.domain + "; ";
-                        }
-                        if (!it.same_site.empty() && (it.same_site == "Strict" || it.same_site == "Lax" || it.same_site == "None")) {
-                            cookie_str += "SameSite=" + it.same_site + "; ";
-                        }
-                        for (const auto& attribute : it.attributes) {
-                            cookie_str += attribute + "; ";
-                        }
-                        for (const auto& attribute : it.extra_attributes) {
-                            cookie_str += attribute.first + "=" + attribute.second + "; ";
-                        }
-
-                        net_response << "Set-Cookie: " << cookie_str << "\r\n";
-                    }
-
-                    if (erase_associated) {
-                        for (const auto& it : settings.associated_session_cookies) {
-                            response.delete_cookies.push_back(it);
-                        }
-                    }
-
-                    for (const auto& it : response.delete_cookies) {
-                        std::string cookie_str = it + "=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; ";
-                        net_response << "Set-Cookie: " << cookie_str << "\r\n";
-                    }
-
-                    if (response.stop) {
-                        return;
-                    }
-
+                auto response = callback(req);
+                std::stringstream net_response;
+                net_response << "HTTP/1.1 " << response.http_status << " " << ssock::http::get_http_message(response.http_status).value_or("Unknown") << "\r\n";
+                if (!response.content_type.empty()) net_response << "Content-Type: " << response.content_type << "\r\n";
+                if (!response.allow_origin.empty()) net_response << "Access-Control-Allow-Origin: " << response.allow_origin << "\r\n";
+                if (!response.body.empty()) {
+                    net_response << "Content-Length: " << response.body.size() << "\r\n";
+                }
+                if (!response.location.empty()) {
+                    net_response << "Location: " << response.location << "\r\n";
+                }
+                if (!response.headers.empty()) {
                     for (const auto& it : response.headers) {
                         net_response << it.name << ": " << it.data << "\r\n";
                     }
+                }
+                if (response.redirect_type == redirect_type::temporary) {
+                    net_response << "Cache-Control: no-cache\r\n";
+                } else if (response.redirect_type == redirect_type::permanent) {
+                    net_response << "Cache-Control: no-store\r\n";
+                }
 
-                    if (response.close) {
-                        net_response << "Connection: close\r\n";
+                if (!session_id_found && settings.enable_session) {
+                    session_id = utility::generate_random_string();
+                    response.cookies.push_back({settings.session_cookie_name, session_id, 0, "/", .same_site = "Strict", .http_only = true, .secure = settings.session_is_secure});
+                } else if (settings.enable_session) {
+                    std::string session_file = settings.session_directory + "/session_" + session_id + ".txt";
+                    std::unordered_map<std::string, std::string> stored = read_from_session_file(session_file);
+
+                    for (const auto& it : response.session) {
+                        stored[it.first] = it.second;
                     }
 
-                    net_response << "\r\n";
-                    net_response << response.body;
-
-                    client_sock->send(net_response.str());
-                    client_sock->close();
+                    write_to_session_file(session_file, stored);
                 }
+
+                for (const auto& it : response.cookies) {
+                    std::string cookie_str = it.name + "=" + it.value + "; ";
+                    if (it.expires != 0) {
+                        cookie_str += "Expires=" + utility::convert_unix_millis_to_gmt(it.expires) + "; ";
+                    } else {
+                        cookie_str += "Expires=session; ";
+                    }
+                    if (it.http_only) {
+                        cookie_str += "HttpOnly; ";
+                    }
+                    if (it.secure) {
+                        cookie_str += "Secure; ";
+                    }
+                    if (!it.path.empty()) {
+                        cookie_str += "Path=" + it.path + "; ";
+                    }
+                    if (!it.domain.empty()) {
+                        cookie_str += "Domain=" + it.domain + "; ";
+                    }
+                    if (!it.same_site.empty() && (it.same_site == "Strict" || it.same_site == "Lax" || it.same_site == "None")) {
+                        cookie_str += "SameSite=" + it.same_site + "; ";
+                    }
+                    for (const auto& attribute : it.attributes) {
+                        cookie_str += attribute + "; ";
+                    }
+                    for (const auto& attribute : it.extra_attributes) {
+                        cookie_str += attribute.first + "=" + attribute.second + "; ";
+                    }
+
+                    net_response << "Set-Cookie: " << cookie_str << "\r\n";
+                }
+
+                if (erase_associated) {
+                    for (const auto& it : settings.associated_session_cookies) {
+                        response.delete_cookies.push_back(it);
+                    }
+                }
+
+                for (const auto& it : response.delete_cookies) {
+                    std::string cookie_str = it + "=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; ";
+                    net_response << "Set-Cookie: " << cookie_str << "\r\n";
+                }
+
+                if (response.stop) {
+                    return;
+                }
+
+                for (const auto& it : response.headers) {
+                    net_response << it.name << ": " << it.data << "\r\n";
+                }
+
+                if (response.close) {
+                    net_response << "Connection: close\r\n";
+                }
+
+                net_response << "\r\n";
+                net_response << response.body;
+
+                client_sock->send(net_response.str());
+                client_sock->close();
             }
         };
     }

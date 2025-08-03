@@ -200,8 +200,8 @@ void test_http_abstr() {
     response_file.close();
 }
 
-void test_http_abstr_2() {
-    ssock::http::server::sync_server(ssock::http::server::server_settings{
+[[noreturn]] void test_http_abstr_2() {
+    ssock::http::server::sync_server server(ssock::http::server::server_settings{
         .port = 8080,
         .enable_session = true,
         .session_directory = "./sessions",
@@ -221,6 +221,10 @@ void test_http_abstr_2() {
                   << "User-Agent: " << req.user_agent << "\n";
         return res;
     });
+
+    while (true) {
+        server.accept();
+    }
 }
 
 int main() {
