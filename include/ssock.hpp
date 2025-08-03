@@ -3087,7 +3087,7 @@ namespace ssock::http {
                 if (session_id_found) {
                     std::erase(session_id, '/');
                     std::filesystem::path session_file = settings.session_directory + "/session_" + session_id + ".txt";
-                    req.session = read_from_session_file(session_file);
+                    req.session = read_from_session_file(session_file.string());
                     req.session_id = session_id;
 
                     if (!std::filesystem::exists(session_file)) {
