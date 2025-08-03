@@ -7,6 +7,7 @@
  */
 #pragma once
 
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -339,6 +340,128 @@ namespace ssock::utility {
         }
 
         return dec;
+    }
+
+    /**
+     * @brief Returns the appropriate content type for a given file name.
+     * @param fn The file name to check.
+     * @return The content type as a string.
+     */
+    [[nodiscard]] inline std::string get_appropriate_content_type(const std::string& fn) {
+        std::size_t pos = fn.find_last_of('.');
+        if (pos == std::string::npos) {
+            return "application/octet-stream";
+        }
+
+        std::string file = fn.substr(pos);
+
+        static const std::unordered_map<std::string, std::string> content_type_map {
+            {".aac", "audio/aac"},
+            {".abw", "application/x-abiword"},
+            {".apng", "image/apng"},
+            {".arc", "application/x-freearc"},
+            {".avif", "image/avif"},
+            {".avi", "video/x-msvideo"},
+            {".azw", "application/vnd.amazon.ebook"},
+            {".bin", "application/octet-stream"},
+            {".bmp", "image/bmp"},
+            {".bz", "application/x-bzip"},
+            {".bz2", "application/x-bzip2"},
+            {".cda", "application/x-cdf"},
+            {".csh", "application/x-csh"},
+            {".css", "text/css"},
+            {".csv", "text/csv"},
+            {".doc", "application/msword"},
+            {".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+            {".eot", "application/vnd.ms-fontobject"},
+            {".epub", "application/epub+zip"},
+            {".gz", "application/gzip"},
+            {".gif", "image/gif"},
+            {".htm", "text/html"},
+            {".html", "text/html"},
+            {".ico", "image/vnd.microsoft.icon"},
+            {".ics", "text/calendar"},
+            {".jar", "application/java-archive"},
+            {".jpeg", "image/jpeg"},
+            {".jpg", "image/jpeg"},
+            {".js", "text/javascript"},
+            {".json", "application/json"},
+            {".jsonld", "application/ld+json"},
+            {".mid", "audio/x-midi"},
+            {".midi", "audio/midi"},
+            {".mjs", "text/javascript"},
+            {".mp3", "audio/mpeg"},
+            {".mp4", "video/mp4"},
+            {".flac", "audio/flac"},
+            {".mpeg", "video/mpeg"},
+            {".mpkg", "application/vnd.apple.installer+xml"},
+            {".odp", "application/vnd.oasis.opendocument.presentation"},
+            {".ods", "application/vnd.oasis.opendocument.spreadsheet"},
+            {".odt", "application/vnd.oasis.opendocument.text"},
+            {".oga", "audio/ogg"},
+            {".ogv", "video/ogg"},
+            {".ogx", "application/ogg"},
+            {".opus", "audio/ogg"},
+            {".otf", "font/otf"},
+            {".png", "image/png"},
+            {".pdf", "application/pdf"},
+            {".php", "application/x-httpd-php"},
+            {".ppt", "application/vnd.ms-powerpoint"},
+            {".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+            {".rar", "application/vnd.rar"},
+            {".rtf", "application/rtf"},
+            {".sh", "application/x-sh"},
+            {".svg", "image/svg+xml"},
+            {".tar", "application/x-tar"},
+            {".tif", "image/tiff"},
+            {".tiff", "image/tiff"},
+            {".ts", "video/mp2t"},
+            {".ttf", "font/ttf"},
+            {".txt", "text/plain"},
+            {".vsd", "application/vnd.visio"},
+            {".wav", "audio/wav"},
+            {".weba", "audio/webm"},
+            {".webm", "video/webm"},
+            {".webp", "image/webp"},
+            {".woff", "font/woff"},
+            {".woff2", "font/woff2"},
+            {".xhtml", "application/xhtml+xml"},
+            {".xls", "application/vnd.ms-excel"},
+            {".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            {".xml", "application/xml"},
+            {".xul", "application/vnd.mozilla.xul+xml"},
+            {".zip", "application/zip"},
+            {".3gp", "video/3gpp"},
+            {".3g2", "video/3gpp2"},
+            {".7z", "application/x-7z-compressed"},
+        };
+
+        if (content_type_map.find(file) != content_type_map.end()) {
+            return content_type_map.at(file);
+        } else {
+            return "application/octet-stream";
+        }
+    }
+
+    /**
+     * @brief Reads the contents of a file into a string.
+     * @param path The path to the file.
+     */
+    [[nodiscard]] static std::string read_file(const std::string& path) {
+        std::ifstream file(path, std::ios::in | std::ios::binary | std::ios::ate);
+        if (!file) {
+            throw std::runtime_error("failed to open file: " + path);
+        }
+
+        std::streamsize size = file.tellg();
+        std::string buffer(size, '\0');
+
+        file.seekg(0, std::ios::beg);
+        if (!file.read(&buffer[0], size)) {
+            throw std::runtime_error("failed to read file: " + path);
+        }
+
+        return buffer;
     }
 }
 
@@ -1234,7 +1357,6 @@ namespace ssock::sock {
                     auto ip = t ? ip_list.get_ipv6() : ip_list.get_ipv4();
                     return ip;
                 } catch (const std::exception& ex) {
-                    std::cerr << "resolve_host exception: " << ex.what() << "\n";
                     return {};
                 }
             };
@@ -1712,7 +1834,7 @@ namespace ssock::sock {
             while (total_sent < len) {
                 ssize_t sent = internal_net::sys_net_send(this->sockfd, data + total_sent, len - total_sent, 0);
                 if (sent <= 0) {
-                    return sent;
+                    return static_cast<int>(sent);
                 }
                 total_sent += sent;
             }
@@ -2175,7 +2297,6 @@ namespace ssock::http {
     struct response {
         int status_code{};
         std::string body{};
-        std::string method{};
         http_status_line status_line{};
 
         std::vector<std::pair<std::string, std::string>> headers{};
@@ -2673,7 +2794,6 @@ namespace ssock::http {
             std::string content_type{"application/json"};
             std::string allow_origin{"*"};
             bool stop{false};
-            bool close{true};
             std::vector<cookie> cookies{};
             std::vector<std::string> delete_cookies{};
             std::unordered_map<std::string, std::string> session{};
@@ -2806,6 +2926,7 @@ namespace ssock::http {
                 raw += headers;
 
                 bool is_chunked = false;
+                bool expect_continue = false;
                 std::size_t content_length = 0;
 
                 std::istringstream header_stream(headers);
@@ -2819,10 +2940,40 @@ namespace ssock::http {
                         } catch (...) {
                             break;
                         }
+                    } else if (line.starts_with("Expect:") && line.find("100-continue") != std::string::npos) {
+                        expect_continue = true;
+                    } else if (line.starts_with("Expect:") && line.find("100-continue") == std::string::npos) {
+                        std::string response = "HTTP/1.1 417 Expectation Failed\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+
+                        client_sock->send(response);
+                        return;
+                    } else if (line.starts_with("Upgrade:") && line.find("websocket") != std::string::npos) {
+                        std::string response = "HTTP/1.1 426 Upgrade Required\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+
+                        client_sock->send(response);
+                        return;
+                    } else if (line.starts_with("Connection:") && line.find("close") != std::string::npos) {
+                        std::string response = "HTTP/1.1 200 OK\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+
+                        client_sock->send(response);
+                        return;
                     }
                 }
 
-                if (is_chunked) {
+                if (expect_continue) {
+                    client_sock->send("HTTP/1.1 100 Continue\r\n\r\n");
+                }
+
+                if (is_chunked && (req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE")) {
                     std::string chunked;
                     while (chunked.find("0\r\n\r\n") == std::string::npos) {
                         std::string chunk = client_sock->recv(5, 8192);
@@ -2835,7 +2986,7 @@ namespace ssock::http {
                     std::string decoded = utility::decode_chunked(chunked);
                     raw = headers + decoded;
                     req.raw_body = raw;
-                } else {
+                } else if (req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE") {
                     std::string body;
                     while (body.size() < content_length) {
                         size_t to_read = content_length - body.size();
@@ -2847,6 +2998,8 @@ namespace ssock::http {
                     }
 
                     req.raw_body = headers + body;
+                } else {
+                    req.raw_body = headers;
                 }
 
                 if (req.raw_body.empty() || req.raw_body.size() > settings.max_request_size) {
@@ -2892,7 +3045,10 @@ namespace ssock::http {
                         throw parsing_error("unsupported HTTP version: " + parsed.status_line.version);
                     }
                 }();
-                req.method = parsed.method;
+                req.method = parsed.status_line.method;
+                if (req.method.empty()) {
+                    throw parsing_error("invalid HTTP method: " + parsed.status_line.method);
+                }
                 auto full_path = parsed.status_line.path;
                 if (full_path.empty() || full_path[0] != '/') {
                     throw parsing_error("invalid path: " + full_path);
@@ -2967,9 +3123,6 @@ namespace ssock::http {
                 net_response << "HTTP/1.1 " << response.http_status << " " << ssock::http::get_http_message(response.http_status).value_or("Unknown") << "\r\n";
                 if (!response.content_type.empty()) net_response << "Content-Type: " << response.content_type << "\r\n";
                 if (!response.allow_origin.empty()) net_response << "Access-Control-Allow-Origin: " << response.allow_origin << "\r\n";
-                if (!response.body.empty()) {
-                    net_response << "Content-Length: " << response.body.size() << "\r\n";
-                }
                 if (!response.location.empty()) {
                     net_response << "Location: " << response.location << "\r\n";
                 }
@@ -3049,8 +3202,10 @@ namespace ssock::http {
                     net_response << it.name << ": " << it.data << "\r\n";
                 }
 
-                if (response.close) {
-                    net_response << "Connection: close\r\n";
+                net_response << "Connection: close\r\n";
+
+                if (!response.body.empty()) {
+                    net_response << "Content-Length: " << response.body.size() << "\r\n";
                 }
 
                 net_response << "\r\n";
