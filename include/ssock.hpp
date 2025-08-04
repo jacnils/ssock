@@ -7,14 +7,19 @@
  */
 #pragma once
 
+#include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 #include <cstring>
 #include <unordered_map>
 #include <variant>
 #include <algorithm>
 #include <ranges>
+#include <functional>
+#include <random>
+#include <filesystem>
 
 #ifndef SSOCK
 #define SSOCK 1
@@ -31,6 +36,8 @@
 #include <arpa/nameser.h>
 #include <resolv.h>
 #include <unistd.h>
+#include <netinet/tcp.h>
+#include <fcntl.h>
 #elif _WIN32
 #define SSOCK_WINDOWS
 #include <winsock2.h>
@@ -155,6 +162,307 @@ namespace ssock {
         explicit dns_error(const char* message) : message(message) {}
         explicit dns_error(const std::string& string) : message(string.c_str()) {};
     };
+}
+
+/**
+ * @brief Namespace for utility functions and classes.
+ * @note Contains helper functions and classes that are not directly related to networking.
+ */
+namespace ssock::utility {
+    /**
+     * @brief Splits a string into tokens based on a delimiter.
+     * @param str The string to split.
+     * @param delimiter The delimiter to use for splitting.
+     * @return A vector of strings containing the tokens.
+     */
+    [[nodiscard]] inline std::vector<std::string> split(const std::string& str, const std::string& delimiter) {
+        std::vector<std::string> tokens;
+        size_t start = 0;
+        size_t end = str.find(delimiter);
+        while (end != std::string::npos) {
+            tokens.push_back(str.substr(start, end - start));
+            start = end + delimiter.length();
+            end = str.find(delimiter, start);
+        }
+        tokens.push_back(str.substr(start, end));
+        return tokens;
+    }
+
+    /**
+     * @brief Joins a vector of strings into a single string with a delimiter.
+     * @param tokens The vector of strings to join.
+     * @param delimiter The delimiter to use for joining.
+     * @return A single string containing the joined tokens.
+     */
+    [[nodiscard]] inline std::string join(const std::vector<std::string>& tokens, const std::string& delimiter) {
+        if (tokens.empty()) return "";
+        std::ostringstream oss;
+        std::copy(tokens.begin(), tokens.end() - 1, std::ostream_iterator<std::string>(oss, delimiter.c_str()));
+        oss << tokens.back();
+        return oss.str();
+    }
+    /**
+     * @brief Generates a random alphanumeric string of a given length.
+     * @param length The length of the random string to generate.
+     * @return A random alphanumeric string.
+     */
+    [[nodiscard]] static std::string generate_random_string(const std::size_t length = 64) {
+        static constexpr char charset[] =
+            "0123456789"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz";
+
+        static constexpr size_t charset_size = sizeof(charset) - 1;
+        std::random_device rd;
+
+        std::string result;
+        result.reserve(length);
+
+        for (std::size_t i = 0; i < length; ++i) {
+            result += charset[rd() % charset_size];
+        }
+
+        return result;
+    }
+    /**
+     * @brief URL-encodes a string.
+     * @param str The string to encode.
+     * @return The URL-encoded string.
+     */
+    static std::string url_encode(const std::string& str) {
+        std::string ret;
+        for (int i = 0; i < str.length(); i++) {
+            char ch = str[i];
+            if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+                ret += ch;
+            } else if (ch == ' ') {
+                ret += '+';
+            } else {
+                ret += '%';
+                ret += "0123456789ABCDEF"[ch >> 4];
+                ret += "0123456789ABCDEF"[ch & 15];
+            }
+        }
+        return ret;
+    }
+    /**
+     * @brief URL-decodes a string.
+     * @param str The string to decode.
+     * @return The URL-decoded string.
+     */
+    static std::string url_decode(const std::string& str) {
+        std::string result;
+        result.reserve(str.size());
+
+        for (std::size_t i = 0; i < str.length(); ++i) {
+            if (str[i] == '%') {
+                if (i + 2 < str.length()) {
+                    char hex1 = str[i + 1];
+                    char hex2 = str[i + 2];
+
+                    if (std::isxdigit(hex1) && std::isxdigit(hex2)) {
+                        int high = std::isdigit(hex1) ? hex1 - '0' : std::tolower(hex1) - 'a' + 10;
+                        int low  = std::isdigit(hex2) ? hex2 - '0' : std::tolower(hex2) - 'a' + 10;
+                        result += static_cast<char>((high << 4) | low);
+                        i += 2;
+                        continue;
+                    }
+                }
+                result += '%';
+            } else if (str[i] == '+') {
+                result += ' ';
+            } else {
+                result += str[i];
+            }
+        }
+
+        return result;
+    }
+    static std::unordered_map<std::string, std::string> parse_fields(const std::string& body) {
+        std::unordered_map<std::string, std::string> result;
+
+        std::size_t start = 0;
+        while (start < body.length()) {
+            std::size_t end = body.find('&', start);
+            if (end == std::string::npos) end = body.length();
+
+            std::string pair = body.substr(start, end - start);
+            std::size_t eq_pos = pair.find('=');
+
+            if (eq_pos != std::string::npos) {
+                std::string key = url_decode(pair.substr(0, eq_pos));
+                std::string value = url_decode(pair.substr(eq_pos + 1));
+                result[std::move(key)] = std::move(value);
+            } else if (!pair.empty()) {
+                std::string key = url_decode(pair);
+                result[std::move(key)] = "";
+            }
+
+            start = end + 1;
+        }
+
+        return result;
+    }
+    inline std::string convert_unix_millis_to_gmt(const int64_t unix_millis) {
+        if (unix_millis == -1) {
+            return "Thu, 01 Jan 1970 00:00:00 GMT";
+        }
+
+        std::time_t time = unix_millis / 1000;
+        std::tm* tm = std::gmtime(&time);
+        char buffer[80];
+        std::strftime(buffer, 80, "%a, %d %b %Y %H:%M:%S GMT", tm);
+        return {(buffer)};
+    }
+    [[nodiscard]] inline std::string decode_chunked(const std::string& encoded) {
+        std::string dec;
+        size_t pos = 0;
+
+        while (pos < encoded.size()) {
+            size_t crlf = encoded.find("\r\n", pos);
+            if (crlf == std::string::npos) break;
+
+            std::string size_str = encoded.substr(pos, crlf - pos);
+            size_t chunk_size = 0;
+            try {
+                chunk_size = std::stoul(size_str, nullptr, 16);
+            } catch (...) {
+                break;
+            }
+
+            if (chunk_size == 0) break;
+
+            pos = crlf + 2;
+            if (pos + chunk_size > encoded.size()) break;
+
+            dec.append(encoded.substr(pos, chunk_size));
+            pos += chunk_size + 2;
+        }
+
+        return dec;
+    }
+
+    /**
+     * @brief Returns the appropriate content type for a given file name.
+     * @param fn The file name to check.
+     * @return The content type as a string.
+     */
+    [[nodiscard]] inline std::string get_appropriate_content_type(const std::string& fn) {
+        std::size_t pos = fn.find_last_of('.');
+        if (pos == std::string::npos) {
+            return "application/octet-stream";
+        }
+
+        std::string file = fn.substr(pos);
+
+        static const std::unordered_map<std::string, std::string> content_type_map {
+            {".aac", "audio/aac"},
+            {".abw", "application/x-abiword"},
+            {".apng", "image/apng"},
+            {".arc", "application/x-freearc"},
+            {".avif", "image/avif"},
+            {".avi", "video/x-msvideo"},
+            {".azw", "application/vnd.amazon.ebook"},
+            {".bin", "application/octet-stream"},
+            {".bmp", "image/bmp"},
+            {".bz", "application/x-bzip"},
+            {".bz2", "application/x-bzip2"},
+            {".cda", "application/x-cdf"},
+            {".csh", "application/x-csh"},
+            {".css", "text/css"},
+            {".csv", "text/csv"},
+            {".doc", "application/msword"},
+            {".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+            {".eot", "application/vnd.ms-fontobject"},
+            {".epub", "application/epub+zip"},
+            {".gz", "application/gzip"},
+            {".gif", "image/gif"},
+            {".htm", "text/html"},
+            {".html", "text/html"},
+            {".ico", "image/vnd.microsoft.icon"},
+            {".ics", "text/calendar"},
+            {".jar", "application/java-archive"},
+            {".jpeg", "image/jpeg"},
+            {".jpg", "image/jpeg"},
+            {".js", "text/javascript"},
+            {".json", "application/json"},
+            {".jsonld", "application/ld+json"},
+            {".mid", "audio/x-midi"},
+            {".midi", "audio/midi"},
+            {".mjs", "text/javascript"},
+            {".mp3", "audio/mpeg"},
+            {".mp4", "video/mp4"},
+            {".flac", "audio/flac"},
+            {".mpeg", "video/mpeg"},
+            {".mpkg", "application/vnd.apple.installer+xml"},
+            {".odp", "application/vnd.oasis.opendocument.presentation"},
+            {".ods", "application/vnd.oasis.opendocument.spreadsheet"},
+            {".odt", "application/vnd.oasis.opendocument.text"},
+            {".oga", "audio/ogg"},
+            {".ogv", "video/ogg"},
+            {".ogx", "application/ogg"},
+            {".opus", "audio/ogg"},
+            {".otf", "font/otf"},
+            {".png", "image/png"},
+            {".pdf", "application/pdf"},
+            {".php", "application/x-httpd-php"},
+            {".ppt", "application/vnd.ms-powerpoint"},
+            {".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+            {".rar", "application/vnd.rar"},
+            {".rtf", "application/rtf"},
+            {".sh", "application/x-sh"},
+            {".svg", "image/svg+xml"},
+            {".tar", "application/x-tar"},
+            {".tif", "image/tiff"},
+            {".tiff", "image/tiff"},
+            {".ts", "video/mp2t"},
+            {".ttf", "font/ttf"},
+            {".txt", "text/plain"},
+            {".vsd", "application/vnd.visio"},
+            {".wav", "audio/wav"},
+            {".weba", "audio/webm"},
+            {".webm", "video/webm"},
+            {".webp", "image/webp"},
+            {".woff", "font/woff"},
+            {".woff2", "font/woff2"},
+            {".xhtml", "application/xhtml+xml"},
+            {".xls", "application/vnd.ms-excel"},
+            {".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            {".xml", "application/xml"},
+            {".xul", "application/vnd.mozilla.xul+xml"},
+            {".zip", "application/zip"},
+            {".3gp", "video/3gpp"},
+            {".3g2", "video/3gpp2"},
+            {".7z", "application/x-7z-compressed"},
+        };
+
+        if (content_type_map.find(file) != content_type_map.end()) {
+            return content_type_map.at(file);
+        } else {
+            return "application/octet-stream";
+        }
+    }
+
+    /**
+     * @brief Reads the contents of a file into a string.
+     * @param path The path to the file.
+     */
+    [[nodiscard]] static std::string read_file(const std::string& path) {
+        std::ifstream file(path, std::ios::in | std::ios::binary | std::ios::ate);
+        if (!file) {
+            throw std::runtime_error("failed to open file: " + path);
+        }
+
+        std::streamsize size = file.tellg();
+        std::string buffer(size, '\0');
+
+        file.seekg(0, std::ios::beg);
+        if (!file.read(&buffer[0], size)) {
+            throw std::runtime_error("failed to read file: " + path);
+        }
+
+        return buffer;
+    }
 }
 
 /**
@@ -405,6 +713,9 @@ namespace ssock::network {
             std::string hostname{};
 
             void throw_if_invalid() const {
+                if (hostname == "localhost") {
+                    return;
+                }
                 if (hostname.empty()) {
                     throw parsing_error("dns_resolver(): hostname cannot be empty");
                 }
@@ -992,7 +1303,13 @@ namespace ssock::sock {
     enum class sock_opt {
         reuse_addr = 1 << 0, /* Reuse address option */
         no_reuse_addr = 1 << 1, /* Do not reuse address option */
+        no_delay = 1 << 2, /* Disable Nagle's algorithm (TCP_NODELAY) */
+        keep_alive = 1 << 3, /* Enable keep-alive option */
+        no_keep_alive = 1 << 4, /* Disable keep-alive option */
+        no_blocking = 1 << 5, /* Set socket to non-blocking mode. Not necessarily supported. */
+        blocking = 1 << 6, /* Set socket to blocking mode */
     };
+
     inline sock_opt operator|(sock_opt lhs, sock_opt rhs) {
         using T = std::underlying_type_t<sock_opt>;
         return static_cast<sock_opt>(static_cast<T>(lhs) | static_cast<T>(rhs));
@@ -1040,11 +1357,9 @@ namespace ssock::sock {
                     auto ip = t ? ip_list.get_ipv6() : ip_list.get_ipv4();
                     return ip;
                 } catch (const std::exception& ex) {
-                    std::cerr << "resolve_host exception: " << ex.what() << "\n";
                     return {};
                 }
             };
-
 
             if (type == sock_addr_type::hostname) {
                 ip = resolve_host(hostname, port, true);
@@ -1158,11 +1473,14 @@ namespace ssock::sock {
         virtual void bind() = 0;
         virtual void unbind() = 0;
         virtual void listen(int backlog) = 0;
+        virtual void listen() = 0;
         virtual std::unique_ptr<sync_sock> accept() = 0;
         virtual int send(const void* buf, size_t len) = 0;
         virtual void send(const std::string& buf) = 0;
         [[nodiscard]] virtual std::string recv(int timeout_seconds) const = 0;
         [[nodiscard]] virtual std::string recv(int timeout_seconds, const std::string& match) const = 0;
+        [[nodiscard]] virtual std::string recv(int timeout_seconds, const std::string& match, size_t eof) const = 0;
+        [[nodiscard]] virtual std::string recv(int timeout_seconds, size_t eof) const = 0;
         virtual void close() = 0;
     };
 
@@ -1215,7 +1533,7 @@ namespace ssock::sock {
          * @param opts The socket options (reuse_addr, no_reuse_addr).
          */
 #ifdef SSOCK_UNIX
-        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr) : addr(addr), type(t) {
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
             if (addr.get_ip().empty()) {
                 throw socket_error("IP address is empty");
             }
@@ -1232,12 +1550,41 @@ namespace ssock::sock {
             } else if (opts & sock_opt::no_reuse_addr) {
                 internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, nullptr, 0);
             }
+            if (opts & sock_opt::no_delay) {
+                internal_net::sys_net_setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &opts, sizeof(opts));
+            }
+            if (opts & sock_opt::keep_alive) {
+                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &opts, sizeof(opts));
+            } else if (opts & sock_opt::no_keep_alive) {
+                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, nullptr, 0);
+            }
+            if (opts & sock_opt::no_blocking) {
+                int flags = fcntl(this->sockfd, F_GETFL, 0);
+                if (flags < 0) {
+                    internal_net::sys_net_close(this->sockfd);
+                    throw socket_error("failed to get socket flags");
+                }
+                if (fcntl(this->sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                    internal_net::sys_net_close(this->sockfd);
+                    throw socket_error("failed to set socket to non-blocking mode");
+                }
+            } else if (opts & sock_opt::blocking) {
+                int flags = fcntl(this->sockfd, F_GETFL, 0);
+                if (flags < 0) {
+                    internal_net::sys_net_close(this->sockfd);
+                    throw socket_error("failed to get socket flags");
+                }
+                if (fcntl(this->sockfd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+                    internal_net::sys_net_close(this->sockfd);
+                    throw socket_error("failed to set socket to blocking mode");
+                }
+            }
 
             this->prep_sa();
         }
 #endif
 #ifdef SSOCK_WINDOWS
-        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr) : addr(addr), type(t) {
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
             if (addr.get_ip().empty()) {
                 throw socket_error("IP address is empty");
             }
@@ -1263,6 +1610,39 @@ namespace ssock::sock {
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
                     throw socket_error("Failed to clear SO_REUSEADDR");
+                }
+            }
+            if (opts & sock_opt::no_delay) {
+                BOOL optval = TRUE;
+                if (setsockopt(this->sockfd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to set TCP_NODELAY");
+                }
+            }
+            if (opts & sock_opt::keep_alive) {
+                BOOL optval = TRUE;
+                if (setsockopt(this->sockfd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to set SO_KEEPALIVE");
+                }
+            } else if (opts & sock_opt::no_keep_alive) {
+                BOOL optval = FALSE;
+                if (setsockopt(this->sockfd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to clear SO_KEEPALIVE");
+                }
+            }
+            if (opts & sock_opt::no_blocking) {
+                u_long mode = 1;
+                if (ioctlsocket(this->sockfd, FIONBIO, &mode) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to set socket to non-blocking mode");
+                }
+            } else if (opts & sock_opt::blocking) {
+                u_long mode = 0;
+                if (ioctlsocket(this->sockfd, FIONBIO, &mode) == SOCKET_ERROR) {
+                    closesocket(this->sockfd);
+                    throw socket_error("Failed to set socket to blocking mode");
                 }
             }
 
@@ -1376,24 +1756,31 @@ namespace ssock::sock {
 #endif
         /**
          * @brief Listen for incoming connections.
-         * @param backlog The maximum number of pending connections (default is 5).
+         * @param backlog The maximum number of pending connections.
          * @note Very barebones, use with care.
          */
 #ifdef SSOCK_UNIX
         void listen(int backlog) override {
-            if (internal_net::sys_net_listen(this->sockfd, backlog) < 0) {
+            if (internal_net::sys_net_listen(this->sockfd, backlog == -1 ? SOMAXCONN : backlog) < 0) {
                 throw socket_error("failed to listen on socket");
             }
         }
 #endif
 #ifdef SSOCK_WINDOWS
         void listen(int backlog) override {
-            if (::listen(this->sockfd, backlog) == SOCKET_ERROR) {
+            if (::listen(this->sockfd, backlog == -1 ? SOMAXCONN : backlog) == SOCKET_ERROR) {
                 int err = WSAGetLastError();
                 throw socket_error("failed to listen socket, error code: " + std::to_string(err));
             }
         }
 #endif
+        /**
+         * @brief Listen for incoming connections with default backlog.
+         * @note Uses SOMAXCONN as the default backlog value.
+         */
+        void listen() override {
+            listen(-1);
+        }
         /**
          * @brief Accept a connection from a client.
          * @return sock_handle The socket handle for the accepted connection.
@@ -1441,18 +1828,38 @@ namespace ssock::sock {
          */
 #ifdef SSOCK_UNIX
         int send(const void* buf, size_t len) override {
-            std::size_t ret = internal_net::sys_net_send(this->sockfd, buf, len, 0);
-            return static_cast<int>(ret);
+            size_t total_sent = 0;
+            const char* data = static_cast<const char*>(buf);
+
+            while (total_sent < len) {
+                ssize_t sent = internal_net::sys_net_send(this->sockfd, data + total_sent, len - total_sent, 0);
+                if (sent <= 0) {
+                    return static_cast<int>(sent);
+                }
+                total_sent += sent;
+            }
+
+            return static_cast<int>(total_sent);
         }
 #endif
 #ifdef SSOCK_WINDOWS
         int send(const void* buf, size_t len) override {
-            int ret = ::send(this->sockfd, static_cast<const char*>(buf), static_cast<int>(len), 0);
-            if (ret == SOCKET_ERROR) {
-                int err = WSAGetLastError();
-                throw socket_error("send() failed, error code: " + std::to_string(err));
+            size_t total_sent = 0;
+            const char* data = static_cast<const char*>(buf);
+
+            while (total_sent < len) {
+                int ret = ::send(this->sockfd, data + total_sent, static_cast<int>(len - total_sent), 0);
+                if (ret == SOCKET_ERROR) {
+                    int err = WSAGetLastError();
+                    throw socket_error("send() failed, error code: " + std::to_string(err));
+                }
+                if (ret == 0) {
+                    break;
+                }
+                total_sent += ret;
             }
-            return ret;
+
+            return static_cast<int>(total_sent);
         }
 #endif
         /**
@@ -1466,10 +1873,11 @@ namespace ssock::sock {
          * @brief Receive data from the server.
          * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely until match is found)
          * @param match The substring to look for in received data.
+         * @param eof The number of bytes to read before considering the match complete.
          * @return The received data as a string.
          */
 #ifdef SSOCK_UNIX
-        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
+        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
             std::string data;
             auto start = std::chrono::steady_clock::now();
 
@@ -1503,14 +1911,17 @@ namespace ssock::sock {
                 }
 
                 if (FD_ISSET(this->sockfd, &readfds)) {
-                    char buf[1024];
+                    char buf[8196];
                     std::size_t received = internal_net::sys_net_recv(this->sockfd, buf, sizeof(buf), 0);
                     if (received == 0) {
                         break;
                     }
                     data.append(buf, received);
+                    if (data.length() >= eof && eof != 0) {
+                        break;
+                    }
 
-                    if (data.find_last_of(match) != std::string::npos && !match.empty()) {
+                    if (!match.empty() && data.find(match) != std::string::npos) {
                         break;
                     }
                 }
@@ -1520,7 +1931,7 @@ namespace ssock::sock {
         }
 #endif
 #ifdef SSOCK_WINDOWS
-        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
+        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
             std::string data;
             auto start = std::chrono::steady_clock::now();
 
@@ -1555,7 +1966,7 @@ namespace ssock::sock {
                 }
 
                 if (FD_ISSET(this->sockfd, &readfds)) {
-                    char buf[1024];
+                    char buf[8196];
                     int received = ::recv(this->sockfd, buf, sizeof(buf), 0);
                     if (received == 0) {
                         break;
@@ -1566,8 +1977,11 @@ namespace ssock::sock {
                     }
 
                     data.append(buf, received);
+                    if (data.length() >= eof && eof != 0) {
+                        break;
+                    }
 
-                    if (!match.empty() && data.find_last_of(match) != std::string::npos) {
+                    if (!match.empty() && data.find(match) != std::string::npos) {
                         break;
                     }
                 }
@@ -1581,7 +1995,25 @@ namespace ssock::sock {
          * @return The received data as a string.
          */
         [[nodiscard]] std::string recv(const int timeout_seconds) const override {
-            return recv(timeout_seconds, "");
+            return recv(timeout_seconds, "", 0);
+        }
+        /**
+         * @brief Receive data from the server until a specific match is found.
+         * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
+         * @param match The substring to look for in received data.
+         * @return The received data as a string.
+         */
+        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
+            return recv(timeout_seconds, match, 0);
+        }
+        /**
+         * @brief Receive data from the server until a specific match is found or a certain amount of data is received.
+         * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
+         * @param eof The number of bytes to read before considering the match complete.
+         * @return The received data as a string.
+         */
+        [[nodiscard]] std::string recv(const int timeout_seconds, size_t eof) const override {
+            return recv(timeout_seconds, "", eof);
         }
 
         /**
@@ -1748,11 +2180,125 @@ namespace ssock::http {
     };
 
     /**
+     * @brief HTTP status codes and their messages.
+     * @note This is a list of common HTTP status codes and their messages.
+     */
+    struct http_status_code {
+        int code;
+        std::string_view message;
+    };
+
+    /**
+     * @brief List of HTTP status codes and their messages.
+     * @note This is a static array of http_status_code structs.
+     */
+    static constexpr std::array<http_status_code, 63> http_status_list = {{
+        {100, "Continue"},
+        {101, "Switching Protocols"},
+        {102, "Processing"},
+        {103, "Early Hints"},
+        {200, "OK"},
+        {201, "Created"},
+        {202, "Accepted"},
+        {203, "Non-Authoritative Information"},
+        {204, "No Content"},
+        {205, "Reset Content"},
+        {206, "Partial Content"},
+        {207, "Multi-Status"},
+        {208, "Already Reported"},
+        {226, "IM Used"},
+        {300, "Multiple Choices"},
+        {301, "Moved Permanently"},
+        {302, "Found"},
+        {303, "See Other"},
+        {304, "Not Modified"},
+        {305, "Use Proxy"},
+        {306, "Switch Proxy"},
+        {307, "Temporary Redirect"},
+        {308, "Permanent Redirect"},
+        {400, "Bad Request"},
+        {401, "Unauthorized"},
+        {402, "Payment Required"},
+        {403, "Forbidden"},
+        {404, "Not Found"},
+        {405, "Method Not Allowed"},
+        {406, "Not Acceptable"},
+        {407, "Proxy Authentication Required"},
+        {408, "Request Timeout"},
+        {409, "Conflict"},
+        {410, "Gone"},
+        {411, "Length Required"},
+        {412, "Precondition Failed"},
+        {413, "Content Too Large"},
+        {414, "URI Too Long"},
+        {415, "Unsupported Media Type"},
+        {416, "Range Not Satisfiable"},
+        {417, "Expectation Failed"},
+        {418, "I'm a teapot"},
+        {421, "Misdirected Request"},
+        {422, "Unprocessable Content"},
+        {423, "Locked"},
+        {424, "Failed Dependency"},
+        {425, "Too Early"},
+        {426, "Upgrade Required"},
+        {428, "Precondition Required"},
+        {429, "Too Many Requests"},
+        {431, "Request Header Fields Too Large"},
+        {451, "Unavailable For Legal Reasons"},
+        {500, "Internal Server Error"},
+        {501, "Not Implemented"},
+        {502, "Bad Gateway"},
+        {503, "Service Unavailable"},
+        {504, "Gateway Timeout"},
+        {505, "HTTP Version Not Supported"},
+        {506, "Variant Also Negotiates"},
+        {507, "Insufficient Storage"},
+        {508, "Loop Detected"},
+        {510, "Not Extended"},
+        {511, "Network Authentication Required"}
+    }};
+
+    /**
+     * @brief Get the HTTP message for a given status code.
+     * @param code The HTTP status code.
+     * @return An optional string_view containing the message, or std::nullopt if the code is not found.
+     */
+    constexpr std::optional<std::string_view> get_http_message(int code) {
+        for (const auto& status : http_status_list) {
+            if (status.code == code)
+                return status.message;
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Get the list of HTTP status codes.
+     * @return A constant reference to the array of HTTP status codes.
+     */
+    constexpr const std::array<http_status_code, http_status_list.size()>& get_http_status_codes() {
+        return http_status_list;
+    }
+
+    /**
+     * @brief A struct that represents an HTTP status line.
+     * @note Used to parse the status line of an HTTP response.
+     */
+    struct http_status_line {
+        bool is_response{false};
+        int status_code{-1};
+        std::string method;
+        std::string path;
+        std::string version;
+    };
+
+    /**
      * @brief A struct that represents an HTTP response.
      */
     struct response {
         int status_code{};
         std::string body{};
+        http_status_line status_line{};
+
         std::vector<std::pair<std::string, std::string>> headers{};
     };
 
@@ -1769,8 +2315,7 @@ namespace ssock::http {
         virtual VPS& get_headers() = 0;
         virtual T& get_body() = 0;
         virtual T& get_input() = 0;
-        virtual T decode_chunked(const std::string& encoded) = 0;
-        virtual int get_status_code() = 0;
+        virtual http_status_line get_status_line() = 0;
         virtual R& parse() = 0;
     };
 
@@ -1786,6 +2331,7 @@ namespace ssock::http {
         R ret{};
         VPS headers{};
         T body{};
+        http_status_line status_line{};
     public:
         /**
          * @brief Constructs a basic_body_parser object.
@@ -1820,76 +2366,41 @@ namespace ssock::http {
             }
         }
         ~body_parser() override = default;
-
         /**
-         * @brief Decode chunked transfer encoding.
-         * @param encoded The encoded string.
-         * @return The decoded string.
+         * @brief Parse the status line from the input.
+         * @return The parsed http_status_line object.
          */
-        [[nodiscard]] T decode_chunked(const std::string& encoded) override {
-            T dec;
-            size_t pos = 0;
+        http_status_line get_status_line() override {
+            size_t newline_pos = input.find('\n');
+            std::string line = (newline_pos != std::string::npos) ? input.substr(0, newline_pos) : input;
 
-            while (pos < encoded.size()) {
-                size_t crlf = encoded.find("\r\n", pos);
-                if (crlf == std::string::npos) break;
-
-                std::string size_str = encoded.substr(pos, crlf - pos);
-                size_t chunk_size = 0;
-                try {
-                    chunk_size = std::stoul(size_str, nullptr, 16);
-                } catch (...) {
-                    break;
-                }
-
-                if (chunk_size == 0) break;
-
-                pos = crlf + 2;
-                if (pos + chunk_size > encoded.size()) break;
-
-                dec.append(encoded.substr(pos, chunk_size));
-                pos += chunk_size + 2;
-            }
-
-            return dec;
-        }
-        /**
-         * @brief Get the status code from the response.
-         * @return The status code.
-         */
-        [[nodiscard]] int get_status_code() override {
-            if (input.find("HTTP/") == std::string::npos) {
-                throw parsing_error("failed to parse status code");
-            }
-            std::string line{};
-            if (input.find('\n') != std::string::npos) {
-                line = input.substr(0, input.find('\n'));
-            } else {
-                line = input;
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
             }
 
             if (line.empty()) {
-                throw parsing_error("failed to parse status code");
+                throw parsing_error("empty HTTP start line");
             }
-
-            if (line.back() == '\r') line.pop_back();
 
             std::istringstream iss(line);
-            std::string version{};
 
-            int status_code{};
+            http_status_line msg;
 
-            iss >> version >> status_code;
-
-            if (iss.fail()) {
-                throw parsing_error("failed to parse status code");
+            if (line.compare(0, 5, "HTTP/") == 0) {
+                msg.is_response = true;
+                iss >> msg.version >> msg.status_code;
+                if (iss.fail() || msg.status_code < 100 || msg.status_code > 599) {
+                    throw parsing_error("invalid HTTP response status line");
+                }
+            } else {
+                iss >> msg.method >> msg.path >> msg.version;
+                if (iss.fail()) {
+                    throw parsing_error("invalid HTTP request start line");
+                }
+                msg.is_response = false;
             }
 
-            if (status_code < 100 || status_code > 599) {
-                throw parsing_error("invalid status code");
-            }
-
-            return status_code;
+            return msg;
         }
         /**
          * @brief Get the input stream.
@@ -1917,23 +2428,10 @@ namespace ssock::http {
          */
         [[nodiscard]] R& parse() override {
             this->ret = R{};
-            this->ret.status_code = get_status_code();
+            this->ret.status_line = get_status_line();
             this->ret.headers = get_headers();
             this->ret.body = get_body();
-
-            // handle chunked
-            bool is_enc{false};
-            for (const auto& [key, val] : ret.headers) {
-                if (key == "Transfer-Encoding" && val.find("chunked") != std::string::npos) {
-                    ret.body = std::move(decode_chunked(input));
-                    is_enc = true;
-                    break;
-                }
-            }
-
-            if (!is_enc) {
-                ret.body = input;
-            }
+            this->ret.body = input;
 
             return ret;
         }
@@ -1953,14 +2451,60 @@ namespace ssock::http {
         std::string version_str{};
         std::vector<std::pair<std::string,std::string>> headers{};
         std::string body{};
-        int timeout{-1};
+        int timeout{5};
 
-        [[nodiscard]] std::string make_request(const std::string& request) const noexcept {
+        [[nodiscard]] std::string make_request(const std::string& request) const {
             sock::sock_addr addr(hostname, port, sock::sock_addr_type::hostname_ipv4);
             sock::sync_sock sock(addr, sock::sock_type::tcp);
             sock.connect();
             sock.send(request);
-            return sock.recv(this->timeout, "\r\n\r\n");
+
+            std::string raw;
+            std::string headers;
+            while (true) {
+                std::string chunk = sock.recv(this->timeout, 8192);
+                if (chunk.empty()) throw std::runtime_error("connection closed during headers");
+                raw += chunk;
+                if (auto pos = raw.find("\r\n\r\n"); pos != std::string::npos) {
+                    headers = raw.substr(0, pos + 4);
+                    raw = raw.substr(pos + 4);
+                    break;
+                }
+            }
+
+            bool is_chunked = false;
+            std::size_t content_length = 0;
+
+            std::istringstream header_stream(headers);
+            std::string line;
+            while (std::getline(header_stream, line) && line != "\r") {
+                if (line.starts_with("Transfer-Encoding:") && line.find("chunked") != std::string::npos) {
+                    is_chunked = true;
+                } else if (line.starts_with("Content-Length:")) {
+                    content_length = std::stoul(line.substr(15));
+                }
+            }
+
+            std::string body;
+
+            if (is_chunked) {
+                std::string chunked_data = std::move(raw);
+                while (chunked_data.find("0\r\n\r\n") == std::string::npos) {
+                    std::string chunk = sock.recv(this->timeout, 8192);
+                    if (chunk.empty()) throw std::runtime_error("connection closed during chunked body");
+                    chunked_data += chunk;
+                }
+                body = utility::decode_chunked(chunked_data);
+            } else {
+                body = std::move(raw);
+                while (body.size() < content_length) {
+                    std::string chunk = sock.recv(this->timeout, 8192);
+                    if (chunk.empty()) throw std::runtime_error("connection closed during body");
+                    body += chunk;
+                }
+            }
+
+            return headers + body;
         }
     public:
         /**
@@ -2175,4 +2719,501 @@ namespace ssock::http {
             return parser.parse();
         }
     };
+
+    namespace server {
+        /**
+         * @brief  Struct that represents a cookie.
+         */
+        struct cookie {
+            std::string name{};
+            std::string value{};
+            int64_t expires{};
+            std::string path{"/"};
+            std::string domain{};
+            std::string same_site{"Strict"};
+            std::vector<std::string> attributes{};
+            bool http_only{false};
+            bool secure{false};
+            std::unordered_map<std::string, std::string> extra_attributes{};
+        };
+
+        /**
+         * @brief  Struct that represents an HTTP header.
+         */
+        struct header {
+            std::string name{};
+            std::string data{};
+        };
+
+        enum class redirect_type {
+            permanent,
+            temporary,
+        };
+
+        /**
+         * @brief  Struct that contains the server settings.
+         */
+        struct server_settings {
+            int port{8080};
+            bool enable_session{true};
+            std::string session_directory{"./"};
+            std::string session_cookie_name{"session_id"};
+            std::vector<std::string> associated_session_cookies{};
+            int64_t max_request_size{1024 * 1024 * 1024};
+            std::vector<std::string> blacklisted_ips{};
+            bool trust_x_forwarded_for{false};
+            int max_connections{-1};
+            bool session_is_secure{true};
+        };
+
+        /**
+         * @brief  Struct that contains the request data.
+         */
+        struct request {
+            std::string endpoint{};
+            std::unordered_map<std::string, std::string> query{};
+            std::string content_type{};
+            std::string body{};
+            std::string raw_body{};
+            std::string method{};
+            std::string ip_address{};
+            std::string user_agent{};
+            unsigned int version{};
+            std::vector<cookie> cookies{};
+            std::unordered_map<std::string, std::string> session{};
+            std::string session_id{};
+            std::unordered_map<std::string, std::string> fields{};
+        };
+
+        /**
+         * @brief  Struct that contains the response data.
+         */
+        struct response {
+            int http_status{200};
+            std::string body{};
+            std::string content_type{"application/json"};
+            std::string allow_origin{"*"};
+            bool stop{false};
+            std::vector<cookie> cookies{};
+            std::vector<std::string> delete_cookies{};
+            std::unordered_map<std::string, std::string> session{};
+            std::string location{};
+            redirect_type redirection{redirect_type::temporary};
+            std::vector<header> headers{};
+        };
+
+        /**
+         * @brief  Class that represents a server.
+         */
+        template <typename T = http::body_parser<std::string>>
+        class sync_server {
+            static std::vector<cookie> get_cookies_from_request(const std::string& cookie_header) {
+                std::vector<cookie> cookies;
+                std::string cookie_str = cookie_header + ";";
+
+                while (cookie_str.find(';') != std::string::npos) {
+                    std::string cookie = cookie_str.substr(0, cookie_str.find(';'));
+                    cookie_str = cookie_str.substr(cookie_str.find(';') + 1);
+
+                    std::string name = cookie.substr(0, cookie.find('='));
+                    std::string value = cookie.substr(cookie.find('=') + 1);
+
+                    if (!name.empty() && !value.empty()) {
+                        if (name.front() == ' ') {
+                            name = name.substr(1);
+                        }
+                        cookies.push_back({name, value});
+                    }
+                }
+
+                return cookies;
+            }
+
+            static std::unordered_map<std::string, std::string> read_from_session_file(const std::string& f) {
+                std::unordered_map<std::string, std::string> session;
+
+                std::ifstream file(f);
+
+                if (!file.good()) {
+                    file.close();
+                    return {};
+                }
+
+                if (!file.is_open()) {
+                    throw std::runtime_error("failed to open session file (read_from_session_file()): " + f);
+                }
+
+                std::string line{};
+                while (std::getline(file, line)) {
+                    if (line.find('=') != std::string::npos) {
+                        std::string key = line.substr(0, line.find('='));
+                        std::string value = line.substr(line.find('=') + 1);
+
+                        session[key] = value;
+                    }
+                }
+
+                file.close();
+
+                return session;
+            }
+
+            static void write_to_session_file(const std::string& f, const std::unordered_map<std::string, std::string>& session) {
+                auto directory = std::filesystem::path(f).parent_path();
+                if (!std::filesystem::exists(directory)) {
+                    std::filesystem::create_directories(directory);
+                }
+                std::ofstream file(f, std::ios::trunc);
+
+                if (!file.is_open() || !file.good()) {
+                    throw std::runtime_error("failed to open session file (write_to_session_file()): " + f);
+                }
+
+                for (const auto& it : session) {
+                    file << it.first << "=" << it.second << "\n";
+                }
+
+                file.close();
+            }
+
+            server_settings settings;
+            std::function<response(const request&)> callback;
+            std::unique_ptr<sock::sync_sock> sock;
+        public:
+            /**
+             * @brief  Constructor for the server class
+             * @param  settings The settings for the server
+             * @param  callback The function to call when a request is made
+             */
+            sync_server(server_settings settings, const std::function<response(const request&)>& callback)
+                : settings(std::move(settings)), callback(callback)
+            {
+                if (!ssock::network::is_valid_port(settings.port)) {
+                    throw parsing_error("invalid port");
+                }
+
+                sock::sock_addr addr = {"localhost", settings.port, ssock::sock::sock_addr_type::hostname};
+                this->sock = std::make_unique<sock::sync_sock>(addr, ssock::sock::sock_type::tcp, ssock::sock::sock_opt::reuse_addr|ssock::sock::sock_opt::no_delay|ssock::sock::sock_opt::blocking);
+
+                try {
+                    sock->bind();
+                } catch (const std::exception&) {
+                    throw socket_error("failed to bind socket, port might be in use");
+                }
+                sock->listen(settings.max_connections);
+            };
+            ~sync_server() {
+                sock->close();
+            }
+
+            /**
+             * @brief  Run the server and attempt to accept an incoming connection
+             * @note Call this function in a loop to keep the server running.
+             */
+            void accept() {
+                auto client_sock = sock->accept();
+
+                if (!client_sock) {
+                    return;
+                }
+
+                request req{};
+                std::string raw{};
+                std::string headers = client_sock->recv(5, "\r\n\r\n");
+                if (headers.empty()) {
+                    return;
+                }
+                raw += headers;
+
+                bool is_chunked = false;
+                bool expect_continue = false;
+                std::size_t content_length = 0;
+
+                std::istringstream header_stream(headers);
+                std::string line;
+                while (std::getline(header_stream, line) && line != "\r") {
+                    if (line.starts_with("Transfer-Encoding:") && line.find("chunked") != std::string::npos) {
+                        is_chunked = true;
+                    } else if (line.starts_with("Content-Length:")) {
+                        try {
+                            content_length = std::stoul(line.substr(15));
+                        } catch (...) {
+                            break;
+                        }
+                    } else if (line.starts_with("Expect:") && line.find("100-continue") != std::string::npos) {
+                        expect_continue = true;
+                    } else if (line.starts_with("Expect:") && line.find("100-continue") == std::string::npos) {
+                        std::string response = "HTTP/1.1 417 Expectation Failed\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+
+                        client_sock->send(response);
+                        return;
+                    } else if (line.starts_with("Upgrade:") && line.find("websocket") != std::string::npos) {
+                        std::string response = "HTTP/1.1 426 Upgrade Required\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+
+                        client_sock->send(response);
+                        return;
+                    } else if (line.starts_with("Connection:") && line.find("close") != std::string::npos) {
+                        std::string response = "HTTP/1.1 200 OK\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+
+                        client_sock->send(response);
+                        return;
+                    }
+                }
+
+                if (expect_continue) {
+                    client_sock->send("HTTP/1.1 100 Continue\r\n\r\n");
+                }
+
+                if (is_chunked && (req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE")) {
+                    std::string chunked;
+                    while (chunked.find("0\r\n\r\n") == std::string::npos) {
+                        std::string chunk = client_sock->recv(5, 8192);
+                        if (chunk.empty()) {
+                            break;
+                        }
+                        chunked += chunk;
+                    }
+
+                    std::string decoded = utility::decode_chunked(chunked);
+                    raw = headers + decoded;
+                    req.raw_body = raw;
+                } else if (req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE") {
+                    std::string body;
+                    while (body.size() < content_length) {
+                        size_t to_read = content_length - body.size();
+                        std::string chunk = client_sock->recv(30, (std::min)(to_read, static_cast<size_t>(8192)));
+                        if (chunk.empty()) {
+                            break;
+                        }
+                        body += chunk;
+                    }
+
+                    req.raw_body = headers + body;
+                } else {
+                    req.raw_body = headers;
+                }
+
+                if (req.raw_body.empty() || req.raw_body.size() > settings.max_request_size) {
+                    return;
+                }
+
+                auto parsed = T(req.raw_body).parse();
+                req.ip_address = [&]() -> std::string {
+                    if (settings.trust_x_forwarded_for) {
+                        for (const auto& it : parsed.headers) {
+                            if (it.first == "X-Forwarded-For") {
+                                auto ips = ssock::utility::split(it.second, ",");
+                                for (const auto& ip : ips) {
+                                    if (ssock::sock::is_ipv4(ip) || ssock::sock::is_ipv6(ip)) {
+                                        return ip;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return {};
+                }();
+
+                if (req.ip_address.empty()) {
+                    req.ip_address = client_sock->get_peer().get_ip();
+                }
+
+                if (!ssock::sock::is_ipv4(req.ip_address) && !ssock::sock::is_ipv6(req.ip_address)) {
+                    throw parsing_error("invalid IP address: " + req.ip_address);
+                }
+
+                if (std::ranges::find(settings.blacklisted_ips, req.ip_address) != settings.blacklisted_ips.end()) {
+                    return;
+                }
+
+                req.body = parsed.body;
+                req.version = [&]() {
+                    if (parsed.status_line.version == "HTTP/1.0") {
+                        return 10;
+                    } else if (parsed.status_line.version == "HTTP/1.1") {
+                        return 11;
+                    } else {
+                        throw parsing_error("unsupported HTTP version: " + parsed.status_line.version);
+                    }
+                }();
+                req.method = parsed.status_line.method;
+                if (req.method.empty()) {
+                    throw parsing_error("invalid HTTP method: " + parsed.status_line.method);
+                }
+                auto full_path = parsed.status_line.path;
+                if (full_path.empty() || full_path[0] != '/') {
+                    throw parsing_error("invalid path: " + full_path);
+                }
+                auto query_pos = full_path.find('?');
+                if (query_pos != std::string::npos) {
+                    req.endpoint = full_path.substr(0, query_pos);
+                    auto query_str = full_path.substr(query_pos + 1);
+                    req.query = ssock::utility::parse_fields(query_str);
+                } else {
+                    req.endpoint = full_path;
+                }
+
+                req.fields = ssock::utility::parse_fields(req.body);
+                for (const auto& it : parsed.headers) {
+                    if (it.first == "Content-Type") {
+                        req.content_type = it.second;
+                    } else if (it.first == "User-Agent") {
+                        req.user_agent = it.second;
+                    } else if (it.first == "Cookie") {
+                        req.cookies = get_cookies_from_request(it.second);
+                    }
+                }
+
+                std::string session_id{};
+                bool session_id_found = false;
+                for (const auto& it : req.cookies) {
+                    if (it.name == settings.session_cookie_name && !it.value.empty() && settings.enable_session) {
+                        session_id = it.value;
+                        session_id_found = true;
+                        break;
+                    }
+                }
+
+                bool erase_associated = false;
+                if (session_id_found) {
+                    std::erase(session_id, '/');
+                    std::filesystem::path session_file = settings.session_directory + "/session_" + session_id + ".txt";
+                    req.session = read_from_session_file(session_file.string());
+                    req.session_id = session_id;
+
+                    if (!std::filesystem::exists(session_file)) {
+                        erase_associated = true;
+                        // remove associated session cookies and session cookie from request
+                        for (const auto& it : settings.associated_session_cookies) {
+                            req.cookies.erase(
+                                std::remove_if(req.cookies.begin(), req.cookies.end(),
+                                               [&it](const cookie& cookie) {
+                                                   return cookie.name == it;
+                                               }),
+                                req.cookies.end()
+                            );
+                        }
+                        req.cookies.erase(
+                            std::remove_if(req.cookies.begin(), req.cookies.end(),
+                                           [this](const cookie& cookie) {
+                                               return cookie.name == settings.session_cookie_name;
+                                           }),
+                            req.cookies.end()
+                        );
+
+                        req.session.clear();
+                        req.session_id.clear();
+                    } else {
+                        req.session = read_from_session_file(session_file.string());
+                        req.session_id = session_id;
+                    }
+                }
+
+                auto response = callback(req);
+                std::stringstream net_response;
+                net_response << "HTTP/1.1 " << response.http_status << " " << ssock::http::get_http_message(response.http_status).value_or("Unknown") << "\r\n";
+                if (!response.content_type.empty()) net_response << "Content-Type: " << response.content_type << "\r\n";
+                if (!response.allow_origin.empty()) net_response << "Access-Control-Allow-Origin: " << response.allow_origin << "\r\n";
+                if (!response.location.empty()) {
+                    net_response << "Location: " << response.location << "\r\n";
+                }
+                if (!response.headers.empty()) {
+                    for (const auto& it : response.headers) {
+                        net_response << it.name << ": " << it.data << "\r\n";
+                    }
+                }
+                if (response.redirection == redirect_type::temporary) {
+                    net_response << "Cache-Control: no-cache\r\n";
+                } else if (response.redirection == redirect_type::permanent) {
+                    net_response << "Cache-Control: no-store\r\n";
+                }
+
+                if (!session_id_found && settings.enable_session) {
+                    session_id = utility::generate_random_string();
+                    response.cookies.push_back({.name = settings.session_cookie_name, .value = session_id, .expires = 0, .path = "/", .same_site = "Strict", .http_only = true, .secure = settings.session_is_secure});
+                } else if (settings.enable_session) {
+                    std::string session_file = settings.session_directory + "/session_" + session_id + ".txt";
+                    std::unordered_map<std::string, std::string> stored = read_from_session_file(session_file);
+
+                    for (const auto& it : response.session) {
+                        stored[it.first] = it.second;
+                    }
+
+                    write_to_session_file(session_file, stored);
+                }
+
+                for (const auto& it : response.cookies) {
+                    std::string cookie_str = it.name + "=" + it.value + "; ";
+                    if (it.expires != 0) {
+                        cookie_str += "Expires=" + utility::convert_unix_millis_to_gmt(it.expires) + "; ";
+                    } else {
+                        cookie_str += "Expires=session; ";
+                    }
+                    if (it.http_only) {
+                        cookie_str += "HttpOnly; ";
+                    }
+                    if (it.secure) {
+                        cookie_str += "Secure; ";
+                    }
+                    if (!it.path.empty()) {
+                        cookie_str += "Path=" + it.path + "; ";
+                    }
+                    if (!it.domain.empty()) {
+                        cookie_str += "Domain=" + it.domain + "; ";
+                    }
+                    if (!it.same_site.empty() && (it.same_site == "Strict" || it.same_site == "Lax" || it.same_site == "None")) {
+                        cookie_str += "SameSite=" + it.same_site + "; ";
+                    }
+                    for (const auto& attribute : it.attributes) {
+                        cookie_str += attribute + "; ";
+                    }
+                    for (const auto& attribute : it.extra_attributes) {
+                        cookie_str += attribute.first + "=" + attribute.second + "; ";
+                    }
+
+                    net_response << "Set-Cookie: " << cookie_str << "\r\n";
+                }
+
+                if (erase_associated) {
+                    for (const auto& it : settings.associated_session_cookies) {
+                        response.delete_cookies.push_back(it);
+                    }
+                }
+
+                for (const auto& it : response.delete_cookies) {
+                    std::string cookie_str = it + "=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; ";
+                    net_response << "Set-Cookie: " << cookie_str << "\r\n";
+                }
+
+                if (response.stop) {
+                    return;
+                }
+
+                for (const auto& it : response.headers) {
+                    net_response << it.name << ": " << it.data << "\r\n";
+                }
+
+                net_response << "Connection: close\r\n";
+
+                if (!response.body.empty()) {
+                    net_response << "Content-Length: " << response.body.size() << "\r\n";
+                }
+
+                net_response << "\r\n";
+                net_response << response.body;
+
+                client_sock->send(net_response.str());
+                client_sock->close();
+            }
+        };
+    }
 }

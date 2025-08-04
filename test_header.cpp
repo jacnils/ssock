@@ -149,7 +149,7 @@ void test_dns_steps(const std::string& hostname = "google.com") {
 }
 
 void test_http_server() {
-    ssock::sock::sock_addr addr = {"127.0.0.1", 8080, ssock::sock::sock_addr_type::ipv4};
+    ssock::sock::sock_addr addr = {"127.0.0.1", 8081, ssock::sock::sock_addr_type::ipv4};
     ssock::sock::sync_sock sock{addr, ssock::sock::sock_type::tcp, ssock::sock::sock_opt::reuse_addr};
 
     // bind the socket
@@ -177,45 +177,80 @@ void test_http_server() {
 }
 
 void test_http_abstr() {
-    ssock::http::client client{"127.0.0.1", "/", 8080, ssock::http::method::GET, ssock::http::version::HTTP_1_1};
+    ssock::http::client client{"127.0.0.1", "/", 8081, ssock::http::method::GET, ssock::http::version::HTTP_1_1};
     client.set_body("<html><body>Hello, World!</body></html>");
     client.set_header("Content-Type", "text/html");
     client.set_header("User-Agent", "ssock-test/1.0");
     client.set_connection("close");
     client.append_headers({{"X-Test-Header", "TestValue"}});
     auto response = client.get();
+    // write our request to a file
+    std::ofstream request_file("http_request.txt");
+    request_file << client.get_body();
+    request_file.close();
+    // write our response to a file
+    std::ofstream response_file("http_response.txt");
     std::cout << "HTTP headers:\n";
     for (const auto& header : response.headers) {
         std::cout << header.first << ": " << header.second << std::endl;
+        response_file << header.first << ": " << header.second << std::endl;
     }
     std::cout << "HTTP body:\n" << response.body << std::endl;
+    response_file << response.body;
+    response_file.close();
+}
+
+[[noreturn]] void test_http_abstr_2() {
+    ssock::http::server::sync_server server(ssock::http::server::server_settings{
+        .port = 8080,
+        .enable_session = true,
+        .session_directory = "./sessions",
+        .session_cookie_name = "ssock-test",
+        .trust_x_forwarded_for = false,
+    }, [](const ssock::http::server::request& req) -> ssock::http::server::response {
+        ssock::http::server::response res;
+        res.http_status = 200;
+        res.body = "<html><body>Hello, World!</body></html>";
+        res.content_type = "text/html";
+        res.headers.push_back({"X-Test-Header", "TestValue"});
+
+        // write log message to console
+        std::cout << "Received request from: " << req.ip_address << "\n"
+                  << "Endpoint: " << req.endpoint << "\n"
+                  << "Method: " << req.method << "\n"
+                  << "User-Agent: " << req.user_agent << "\n";
+        return res;
+    });
+
+    while (true) {
+        server.accept();
+    }
 }
 
 int main() {
-    try {
-        std::cout << "ssock.hpp" << std::endl;
-        test_socket();
-        test_dns("google.com");
-        test_dns("forwarderfactory.com");
-        test_dns("jacobnilsson.com");
-        test_dns_steps("google.com");
-        test_dns_steps("forwarderfactory.com");
-        test_dns_steps("jacobnilsson.com");
+   std::cout << "ssock.hpp" << std::endl;
+   test_socket();
+   test_dns("google.com");
+   test_dns("forwarderfactory.com");
+   test_dns("jacobnilsson.com");
+   test_dns_steps("google.com");
+   test_dns_steps("forwarderfactory.com");
+   test_dns_steps("jacobnilsson.com");
 
-        std::thread server_thread([]() {
-            try {
-                test_http_server();
-            } catch (const std::exception& e) {
-                std::cerr << "HTTP Server Error: " << e.what() << std::endl;
-            }
-        });
-        server_thread.detach();
-        std::this_thread::sleep_for(std::chrono::seconds(2)); // give the server time to start
+   std::thread server_thread([]() {
+       try {
+           test_http_server();
+       } catch (const std::exception& e) {
+           std::cerr << "HTTP Server Error: " << e.what() << std::endl;
+       }
+   });
+   server_thread.detach();
+   std::this_thread::sleep_for(std::chrono::seconds(1)); // give the server time to start
+   test_http_abstr();
 
-        test_http_abstr();
+   std::cout << "---- END OF CLIENT TESTS ----" << std::endl;
 
-        return EXIT_SUCCESS;
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-    }
+   test_http_abstr_2();
+
+   return EXIT_SUCCESS;
 }
