@@ -227,6 +227,42 @@ void test_http_abstr() {
     }
 }
 
+void test_get_dns_nameservers() {
+    auto nameservers = ssock::network::experimental::dns::get_nameservers();
+
+    std::cout << "Nameservers:\n";
+    if (nameservers.has_ipv4()) {
+        for (const auto& it : nameservers.get_ipv4()) {
+            std::cout << "IPv4: " << it << "\n";
+        }
+    }
+    if (nameservers.has_ipv6()) {
+        for (const auto& it : nameservers.get_ipv6()) {
+            std::cout << "IPv6: " << it << "\n";
+        }
+    }
+
+    /* overriding:
+    nameservers = ssock::network::experimental::dns::dns_nameserver_list{
+        {"8.8.8.8"}, {}
+    };
+    */
+
+    ssock::network::experimental::dns::sync_dns_resolver resolver(nameservers);
+    auto list = resolver.resolve_hostname("google.com");
+    std::cout << "Resolved IPs for google.com:\n";
+    if (list.contains_ipv4()) {
+        std::cout << "IPv4: " << list.get_ipv4() << "\n";
+    } else {
+        std::cout << "No IPv4 address found.\n";
+    }
+    if (list.contains_ipv6()) {
+        std::cout << "IPv6: " << list.get_ipv6() << "\n";
+    } else {
+        std::cout << "No IPv6 address found.\n";
+    }
+}
+
 int main() {
    std::cout << "ssock.hpp" << std::endl;
    test_socket();
@@ -248,6 +284,7 @@ int main() {
    std::this_thread::sleep_for(std::chrono::seconds(1)); // give the server time to start
    test_http_abstr();
 
+   test_get_dns_nameservers();
    std::cout << "---- END OF CLIENT TESTS ----" << std::endl;
 
    test_http_abstr_2();

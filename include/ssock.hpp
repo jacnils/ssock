@@ -469,7 +469,8 @@ namespace ssock::utility {
  * @brief Namespace for the ssock library.
  * @note Contains network-related classes and functions.
  */
-namespace ssock::network {
+namespace ssock::network
+{
     namespace dns {
         class dns_resolver;
     };
@@ -629,9 +630,50 @@ namespace ssock::network {
             return point_to_point;
         }
     };
+
+    /**
+     * @brief A function that gets the local network interfaces.
+     * @return A vector of network_interface structs that contain the local network interfaces.
+     */
+    inline std::vector<network_interface> get_interfaces();
+    /**
+     * @brief A function that checks if a usable IPv6 address exists.
+     * @return True if a usable IPv6 address exists, false otherwise.
+     * @note This function checks the local network interfaces for a usable IPv6 address.
+     */
+    static bool usable_ipv6_address_exists();
+    /**
+     * @brief A function that checks if a string is a valid IPv4 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv4 address, false otherwise.
+     */
+    static bool is_ipv4(const std::string& ip);
+    /**
+     * @brief A function that checks if a string is a valid IPv6 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv6 address, false otherwise.
+     */
+    static bool is_ipv6(const std::string& ip);
+    /**
+     * @brief A function that checks if a port is valid.
+     * @param port The port to check.
+     * @return True if the port is valid, false otherwise.
+     */
+    static bool is_valid_port(int port);
+
     namespace dns {
         enum class dns_record_type {
-            A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, PTR, CAA, OTHER
+            A = 1,
+            AAAA = 28,
+            CNAME = 5,
+            MX = 15,
+            NS = 2,
+            TXT = 16,
+            SOA = 6,
+            SRV = 33,
+            PTR = 12,
+            CAA = 257,
+            OTHER = 0,
         };
 
         struct generic_record_data {
@@ -888,30 +930,30 @@ namespace ssock::network {
                     rec.type = dns_record_type::OTHER;
 
                     switch (type) {
-                        case ns_t_a: {
+                    case ns_t_a: {
                             char ip[INET_ADDRSTRLEN];
                             inet_ntop(AF_INET, rdata, ip, sizeof(ip));
                             rec.type = dns_record_type::A;
                             auto list = sock_ip_list{ip, ""};
                             rec.data = a_record_data{list};
                             break;
-                        }
-                        case ns_t_aaaa: {
+                    }
+                    case ns_t_aaaa: {
                             char ip[INET6_ADDRSTRLEN];
                             inet_ntop(AF_INET6, rdata, ip, sizeof(ip));
                             rec.type = dns_record_type::AAAA;
                             auto list = sock_ip_list{"", ip};
                             rec.data = aaaa_record_data{list};
                             break;
-                        }
-                        case ns_t_cname: {
+                    }
+                    case ns_t_cname: {
                             char cname[NS_MAXDNAME];
                             ns_name_uncompress(response, response + len, rdata, cname, sizeof(cname));
                             rec.type = dns_record_type::CNAME;
                             rec.data = cname_record_data{cname};
                             break;
-                        }
-                        case ns_t_txt: {
+                    }
+                    case ns_t_txt: {
                             txt_record_data txt;
                             int offset = 0;
                             while (offset < rdlen) {
@@ -922,12 +964,12 @@ namespace ssock::network {
                             rec.type = dns_record_type::TXT;
                             rec.data = txt;
                             break;
-                        }
-                        default: {
+                    }
+                    default: {
                             std::vector<uint8_t> raw(rdata, rdata + rdlen);
                             rec.data = generic_record_data{type, raw};
                             break;
-                        }
+                    }
                     }
 
                     records.push_back(std::move(rec));
@@ -969,26 +1011,26 @@ namespace ssock::network {
                     result.type = dns_record_type::OTHER;
 
                     switch (rec->wType) {
-                        case DNS_TYPE_A: {
+                    case DNS_TYPE_A: {
                             char ip[INET_ADDRSTRLEN];
                             inet_ntop(AF_INET, &rec->Data.A.IpAddress, ip, sizeof(ip));
                             result.type = dns_record_type::A;
                             result.data = a_record_data{sock_ip_list{ip, ""}};
                             break;
-                        }
-                        case DNS_TYPE_AAAA: {
+                    }
+                    case DNS_TYPE_AAAA: {
                             char ip[INET6_ADDRSTRLEN];
                             inet_ntop(AF_INET6, rec->Data.AAAA.Ip6Address.IP6Byte, ip, sizeof(ip));
                             result.type = dns_record_type::AAAA;
                             result.data = aaaa_record_data{sock_ip_list{"", ip}};
                             break;
-                        }
-                        case DNS_TYPE_CNAME: {
+                    }
+                    case DNS_TYPE_CNAME: {
                             result.type = dns_record_type::CNAME;
                             result.data = cname_record_data{rec->Data.CNAME.pNameHost};
                             break;
-                        }
-                        case DNS_TYPE_TEXT: {
+                    }
+                    case DNS_TYPE_TEXT: {
                             txt_record_data txt;
                             for (DWORD i = 0; i < rec->Data.TXT.dwStringCount; ++i) {
                                 txt.text.emplace_back(rec->Data.TXT.pStringArray[i]);
@@ -996,11 +1038,11 @@ namespace ssock::network {
                             result.type = dns_record_type::TXT;
                             result.data = txt;
                             break;
-                        }
-                        default: {
+                    }
+                    default: {
                             result.data = generic_record_data{rec->wType, {}};
                             break;
-                        }
+                    }
                     }
 
                     records.push_back(std::move(result));
@@ -1014,35 +1056,6 @@ namespace ssock::network {
         };
     }
 
-    /**
-     * @brief A function that gets the local network interfaces.
-     * @return A vector of network_interface structs that contain the local network interfaces.
-     */
-    inline std::vector<network_interface> get_interfaces();
-    /**
-     * @brief A function that checks if a usable IPv6 address exists.
-     * @return True if a usable IPv6 address exists, false otherwise.
-     * @note This function checks the local network interfaces for a usable IPv6 address.
-     */
-    static bool usable_ipv6_address_exists();
-    /**
-     * @brief A function that checks if a string is a valid IPv4 address.
-     * @param ip The string to check.
-     * @return True if the string is a valid IPv4 address, false otherwise.
-     */
-    static bool is_ipv4(const std::string& ip);
-    /**
-     * @brief A function that checks if a string is a valid IPv6 address.
-     * @param ip The string to check.
-     * @return True if the string is a valid IPv6 address, false otherwise.
-     */
-    static bool is_ipv6(const std::string& ip);
-    /**
-     * @brief A function that checks if a port is valid.
-     * @param port The port to check.
-     * @return True if the port is valid, false otherwise.
-     */
-    static bool is_valid_port(int port);
     /**
      * @brief Get a list of all network interfaces on the system.
      * @return A vector of network_interface objects.
@@ -2156,6 +2169,431 @@ namespace ssock::sock {
      */
     static bool is_valid_port(const int port) {
         return port > 0 && port <= 65535;
+    }
+}
+
+namespace ssock::network
+{
+    namespace experimental::dns {
+        class dns_nameserver_list {
+            std::vector<std::string> ipv4{};
+            std::vector<std::string> ipv6{};
+
+            friend dns_nameserver_list get_nameservers();
+        public:
+            dns_nameserver_list() = default;
+            dns_nameserver_list(std::vector<std::string> ipv4, std::vector<std::string> ipv6)
+    : ipv4(std::move(ipv4)), ipv6(std::move(ipv6)) {
+                if (this->ipv4.empty() && this->ipv6.empty()) {
+                    throw parsing_error("dns_nameserver(): at least one IP address must be provided");
+                }
+            }
+            std::vector<std::string> get_ipv4() const {
+                if (!has_ipv4()) {
+                    throw parsing_error("dns_nameserver(): no IPv4 addresses available");
+                }
+                return ipv4;
+            }
+            std::vector<std::string> get_ipv6() const {
+                if (!has_ipv6()) {
+                    throw parsing_error("dns_nameserver(): no IPv6 addresses available");
+                }
+                return ipv6;
+            }
+            bool has_ipv4() const noexcept {
+                return !ipv4.empty();
+            }
+            bool has_ipv6() const noexcept {
+                return !ipv6.empty();
+            }
+        };
+#ifdef SSOCK_UNIX
+        [[nodiscard]] inline dns_nameserver_list get_nameservers() {
+            if (!std::filesystem::exists("/etc/resolv.conf")) {
+                throw parsing_error("dns_nameserver(): /etc/resolv.conf does not exist");
+            }
+            std::ifstream file("/etc/resolv.conf");
+            if (!file.is_open()) {
+                throw parsing_error("failed to open /etc/resolv.conf");
+            }
+
+            std::vector<std::string> ipv4_addrs;
+            std::vector<std::string> ipv6_addrs;
+
+            std::string line;
+            while (std::getline(file, line)) {
+                size_t start = line.find_first_not_of(" \t");
+                if (start == std::string::npos) continue;
+                if (line.compare(start, 10, "nameserver") != 0) continue;
+
+                std::istringstream iss(line.substr(start));
+                std::string keyword, ip;
+                iss >> keyword >> ip;
+
+                if (!ip.empty() && ip.front() == '[' && ip.back() == ']') {
+                    ip = ip.substr(1, ip.size() - 2);
+                }
+
+                if (ip.empty()) continue;
+                if (is_ipv4(ip)) {
+                    ipv4_addrs.push_back(ip);
+                } else if (is_ipv6(ip)) {
+                    ipv6_addrs.push_back(ip);
+                } else {
+                    continue;
+                }
+            }
+
+            return dns_nameserver_list(std::move(ipv4_addrs), std::move(ipv6_addrs));
+        }
+#endif
+#ifdef SSOCK_WINDOWS
+        [[nodiscard]] inline dns_nameserver_list get_nameservers() {
+            std::vector<std::string> ipv4_addrs;
+            std::vector<std::string> ipv6_addrs;
+
+            ULONG bufsiz = 0;
+            DWORD result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &bufsiz);
+            if (result != ERROR_BUFFER_OVERFLOW) {
+                throw parsing_error("failed to get adapter buffer size");
+            }
+
+            std::vector<char> buffer(bufsiz);
+            IP_ADAPTER_ADDRESSES* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+
+            result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &bufsiz);
+            if (result != NO_ERROR) {
+                throw parsing_error("GetAdaptersAddresses failed");
+            }
+
+            for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
+                IP_ADAPTER_DNS_SERVER_ADDRESS* dns = adapter->FirstDnsServerAddress;
+                while (dns) {
+                    char ipstr[INET6_ADDRSTRLEN] = {};
+                    sockaddr* sa = dns->Address.lpSockaddr;
+
+                    if (sa->sa_family == AF_INET) {
+                        auto sin = reinterpret_cast<sockaddr_in*>(sa);
+                        inet_ntop(AF_INET, &sin->sin_addr, ipstr, sizeof(ipstr));
+
+                        if (!is_ipv4(ipstr)) {
+                            dns = dns->Next;
+                            continue;
+                        }
+
+                        ipv4_addrs.emplace_back(ipstr);
+                    } else if (sa->sa_family == AF_INET6) {
+                        auto sin6 = reinterpret_cast<sockaddr_in6*>(sa);
+                        inet_ntop(AF_INET6, &sin6->sin6_addr, ipstr, sizeof(ipstr));
+
+                        if (!is_ipv6(ipstr)) {
+                            dns = dns->Next;
+                            continue;
+                        }
+
+                        ipv6_addrs.emplace_back(ipstr);
+                    }
+
+                    dns = dns->Next;
+                }
+            }
+        }
+#endif
+
+        class dns_query_builder {
+            std::vector<uint8_t> packet;
+            uint16_t id;
+            bool recursion{true};
+
+            void encode_name(const std::string& name) {
+                size_t start = 0;
+                while (true) {
+                    size_t pos = name.find('.', start);
+                    if (pos == std::string::npos) pos = name.size();
+                    size_t len = pos - start;
+                    packet.push_back(static_cast<uint8_t>(len));
+                    for (size_t i = 0; i < len; ++i) {
+                        packet.push_back(name[start + i]);
+                    }
+                    if (pos == name.size()) break;
+                    start = pos + 1;
+                }
+                packet.push_back(0); // \0
+            }
+            void write_uint16_t(uint16_t value) {
+                packet.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+                packet.push_back(static_cast<uint8_t>(value & 0xFF));
+            }
+            void write_uint32_t(uint32_t value) {
+                packet.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+                packet.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+            }
+        public:
+            explicit dns_query_builder(uint16_t _id = 0): id(_id) {
+                if (id == 0) {
+                    this->id = static_cast<uint16_t>(rand() & 0xFFFF);
+                }
+
+                packet.resize(12);
+
+                packet[0] = static_cast<uint8_t>((id >> 8) & 0xFF);
+                packet[1] = static_cast<uint8_t>(id & 0xFF);
+
+                uint16_t flags = recursion ? 0x0100 : 0x0000;
+                packet[2] = static_cast<uint8_t>((flags >> 8) & 0xFF);
+                packet[3] = static_cast<uint8_t>(flags & 0xFF);
+
+                for (int i = 4; i < 12; ++i) {
+                    packet[i] = 0;
+                }
+            }
+
+            void set_recursion_desired(bool desired) {
+                recursion = desired;
+                uint16_t flags = recursion ? 0x0100 : 0x0000;
+                packet[2] = static_cast<uint8_t>((flags >> 8) & 0xFF);
+                packet[3] = static_cast<uint8_t>(flags & 0xFF);
+            }
+            void add_question(const std::string& name, network::dns::dns_record_type type = network::dns::dns_record_type::A, uint16_t record_class = 1) {
+                encode_name(name);
+                write_uint16_t(static_cast<uint16_t>(type));
+                write_uint16_t(record_class);
+
+                uint16_t qdcount = (packet[4] << 8) | packet[5];
+                ++qdcount;
+
+                packet[4] = static_cast<uint8_t>((qdcount >> 8) & 0xFF);
+                packet[5] = static_cast<uint8_t>(qdcount & 0xFF);
+            }
+            const std::vector<uint8_t>& build() {
+                return this->packet;
+            }
+        };
+
+        class dns_response_parser {
+            const std::vector<uint8_t>& data;
+            size_t offset = 0;
+
+            uint16_t read_uint16() {
+                uint16_t val = (data[offset] << 8) | data[offset + 1];
+                offset += 2;
+                return val;
+            }
+
+            uint32_t read_uint32() {
+                uint32_t val = (data[offset] << 24) | (data[offset + 1] << 16) |
+                               (data[offset + 2] << 8) | data[offset + 3];
+                offset += 4;
+                return val;
+            }
+
+            std::string decode_name(size_t pos_override = std::string::npos) {
+                std::string name;
+                size_t pos = (pos_override == std::string::npos) ? offset : pos_override;
+                bool jumped = false;
+
+                while (true) {
+                    uint8_t len = data[pos];
+                    if ((len & 0xC0) == 0xC0) {
+                        uint16_t pointer = ((len & 0x3F) << 8) | data[pos + 1];
+                        if (!jumped) offset = pos + 2;
+                        pos = pointer;
+                        jumped = true;
+                        continue;
+                    }
+
+                    if (len == 0) {
+                        if (!jumped) offset = pos + 1;
+                        break;
+                    }
+
+                    if (!name.empty()) name += ".";
+                    name += std::string(reinterpret_cast<const char*>(&data[pos + 1]), len);
+                    pos += len + 1;
+                }
+
+                return name;
+            }
+
+        public:
+            explicit dns_response_parser(const std::vector<uint8_t>& bytes) : data(bytes) {
+                if (data.size() < 12) throw parsing_error("DNS response too short");
+            }
+
+            std::vector<network::dns::dns_record> parse() {
+                offset = 0;
+
+                read_uint16();
+                read_uint16();
+                uint16_t qdcount = read_uint16();
+                uint16_t ancount = read_uint16();
+                read_uint16();
+                read_uint16();
+
+                for (int i = 0; i < qdcount; ++i) {
+                    decode_name();
+                    read_uint16();
+                    read_uint16();
+                }
+
+                std::vector<network::dns::dns_record> results;
+
+                for (int i = 0; i < ancount; ++i) {
+                    std::string name = decode_name();
+                    uint16_t type = read_uint16();
+                    uint16_t record_class = read_uint16();
+                    uint32_t ttl = read_uint32();
+                    uint16_t rdlength = read_uint16();
+
+                    if (offset + rdlength > data.size()) {
+                        throw parsing_error("rdata length out of bounds");
+                    }
+
+                    network::dns::dns_record rec;
+                    rec.name = std::move(name);
+                    rec.record_class = record_class;
+                    rec.ttl = ttl;
+
+                    if (type == 1 && rdlength == 4) {
+                        char ipbuf[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &data[offset], ipbuf, sizeof(ipbuf));
+                        rec.type = network::dns::dns_record_type::A;
+                        rec.data = network::dns::a_record_data{{std::string(ipbuf), ""}};
+                    } else if (type == 28 && rdlength == 16) {
+                        char ipbuf[INET6_ADDRSTRLEN];
+                        inet_ntop(AF_INET6, &data[offset], ipbuf, sizeof(ipbuf));
+                        rec.type = network::dns::dns_record_type::AAAA;
+                        rec.data = network::dns::aaaa_record_data{{"", std::string(ipbuf)}};
+                    } else { // TODO: Implement support for other records than A and AAAA.
+                        rec.type = network::dns::dns_record_type::OTHER;
+                        rec.data = network::dns::generic_record_data{type, std::vector<uint8_t>{data.begin() + offset, data.begin() + offset + rdlength}};
+                    }
+
+                    offset += rdlength;
+                    results.push_back(std::move(rec));
+                }
+
+                return results;
+            }
+        };
+
+        class basic_sync_dns_resolver {
+        public:
+            [[nodiscard]] sock_ip_list resolve_hostname(const std::string& hostname) const;
+            explicit basic_sync_dns_resolver() = default;
+            explicit basic_sync_dns_resolver(dns_nameserver_list list) {};
+            virtual ~basic_sync_dns_resolver() = default;
+        };
+
+        class sync_dns_resolver : basic_sync_dns_resolver {
+            dns_nameserver_list list{};
+
+            void throw_if_invalid() const {
+                if (list.has_ipv4() || list.has_ipv6()) {
+                    return;
+                }
+                throw parsing_error("sync_dns_resolver(): at least one IP address must be provided");
+            }
+        public:
+            sync_dns_resolver(const dns_nameserver_list& list) : list(list) {
+                throw_if_invalid();
+            }
+            sync_dns_resolver() : list(get_nameservers()) {
+                throw_if_invalid();
+            }
+            [[nodiscard]] sock_ip_list resolve_hostname(const std::string& hostname) {
+                if (is_ipv4(hostname)) {
+                    return sock_ip_list{hostname, ""};
+                } else if (is_ipv6(hostname)) {
+                    return sock_ip_list{"", hostname};
+                }
+
+                enum class address_type {
+                    ipv4,
+                    ipv6
+                };
+
+                address_type type = address_type::ipv4;
+                if (usable_ipv6_address_exists() && list.has_ipv6()) {
+                    type = address_type::ipv6;
+                } else if (!list.has_ipv4()) {
+                    throw parsing_error("sync_dns_resolver(): no usable IP addresses available");
+                }
+
+                dns_query_builder a_builder;
+                a_builder.add_question(hostname, network::dns::dns_record_type::A);
+                std::vector<unsigned char> a_query = a_builder.build();
+                dns_query_builder aaaa_builder;
+                aaaa_builder.add_question(hostname, network::dns::dns_record_type::AAAA);
+                std::vector<unsigned char> aaaa_query = aaaa_builder.build();
+
+
+                bool successful = false;
+
+                std::vector<std::string> a_records{};
+                std::vector<std::string> aaaa_records{};
+
+                const auto try_dns_query = [&a_records, &aaaa_records](const std::string& server, ssock::sock::sock_addr_type type, std::vector<unsigned char>& query) -> bool {
+                    ssock::sock::sock_addr addr{server, 53, type};
+                    ssock::sock::sync_sock sock(addr, ssock::sock::sock_type::udp,
+                        ssock::sock::sock_opt::blocking|ssock::sock::sock_opt::no_delay);
+
+                    sock.connect();
+                    sock.send(reinterpret_cast<const char*>(query.data()), query.size());
+
+                    std::string response = sock.recv(2, 512);
+                    if (response.size() < 12) {
+                        return false;
+                    }
+
+                    std::vector<uint8_t> response_bytes(response.begin(), response.end());
+                    dns_response_parser parser(response_bytes);
+
+                    auto records = parser.parse();
+                    for (const auto& r : records) {
+                        if (r.type == network::dns::dns_record_type::A) {
+                            auto a = std::get<network::dns::a_record_data>(r.data);
+                            a_records.push_back(a.ip.get_ipv4());
+                        } else if (r.type == network::dns::dns_record_type::AAAA) {
+                            auto aaaa = std::get<network::dns::aaaa_record_data>(r.data);
+                            aaaa_records.push_back(aaaa.ip.get_ipv6());
+                        }
+                    }
+
+                    return !response.empty();
+                };
+
+                if (type == address_type::ipv6 && list.has_ipv6()) {
+                    for (const auto& server : list.get_ipv6()) {
+                        bool a_success = try_dns_query(server, ssock::sock::sock_addr_type::ipv6, a_query);
+                        bool aaaa_success = try_dns_query(server, ssock::sock::sock_addr_type::ipv6, aaaa_query);
+                        if (a_success || aaaa_success) {
+                            successful = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!successful && list.has_ipv4()) {
+                    for (const auto& server : list.get_ipv4()) {
+                        bool a_success = try_dns_query(server, ssock::sock::sock_addr_type::ipv4, a_query);
+                        bool aaaa_success = try_dns_query(server, ssock::sock::sock_addr_type::ipv4, aaaa_query);
+                        if (a_success || aaaa_success) {
+                            successful = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!successful) {
+                    throw dns_error("all DNS queries failed.");
+                }
+
+                // assemble the final sock_ip_list
+                sock_ip_list result{a_records.empty() ? "" : a_records.at(0), aaaa_records.empty() ? "" : aaaa_records.at(0)};
+                return result;
+            }
+        };
     }
 }
 
