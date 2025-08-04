@@ -29,6 +29,12 @@ else()
             resolv
     )
 endif()
+if (APPLE)
+    target_link_libraries(ssock INTERFACE
+            "-framework SystemConfiguration"
+            "-framework CoreFoundation"
+    )
+endif()
 
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
         DESTINATION include
@@ -76,6 +82,12 @@ if (WIN32)
 else()
     target_link_libraries(ssock-build-test
             resolv
+    )
+endif()
+if (APPLE)
+    target_link_libraries(ssock-build-test
+            "-framework SystemConfiguration"
+            "-framework CoreFoundation"
     )
 endif()
 

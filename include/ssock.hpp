@@ -26,6 +26,11 @@
 #endif
 // SSOCK_DEBUG
 
+#if defined(__APPLE__)
+#define SSOCK_MACOS
+#include <SystemConfiguration/SystemConfiguration.h>
+#endif
+
 #if defined(__unix__) || defined(__unix) || defined(__APPLE__) && defined(__MACH__)
 #define SSOCK_UNIX
 #include <sys/socket.h>
@@ -463,14 +468,14 @@ namespace ssock::utility {
 
         return buffer;
     }
+
 }
 
 /**
  * @brief Namespace for the ssock library.
  * @note Contains network-related classes and functions.
  */
-namespace ssock::network
-{
+namespace ssock::network {
     namespace dns {
         class dns_resolver;
     };
@@ -748,6 +753,60 @@ namespace ssock::network
             uint16_t record_class = 1;
             uint32_t ttl{};
             dns_record_data data;
+
+            static std::string serialize_record_data(const dns_record& record) {
+                return std::visit([&]<typename T0>(const T0& value) -> std::string {
+                    using T = std::decay_t<T0>;
+                    if constexpr (std::is_same_v<T, a_record_data> || std::is_same_v<T, aaaa_record_data>) {
+                        std::ostringstream oss;
+                        for (const auto& ip : value.ip) {
+                            oss << ip << ",";
+                        }
+                        std::string result = oss.str();
+                        if (!result.empty()) result.pop_back(); // remove last comma
+                        return result;
+                    } else if constexpr (std::is_same_v<T, cname_record_data>) {
+                        return value.cname;
+                    } else if constexpr (std::is_same_v<T, mx_record_data>) {
+                        return std::to_string(value.preference) + " " + value.exchange;
+                    } else if constexpr (std::is_same_v<T, ns_record_data>) {
+                        return value.ns;
+                    } else if constexpr (std::is_same_v<T, txt_record_data>) {
+                        std::ostringstream oss;
+                        for (const auto& txt : value.text) {
+                            oss << "\"" << txt << "\" ";
+                        }
+                        std::string result = oss.str();
+                        if (!result.empty()) result.pop_back(); // remove last space
+                        return result;
+                    } else if constexpr (std::is_same_v<T, soa_record_data>) {
+                        return value.mname + " " + value.rname + " " +
+                               std::to_string(value.serial) + " " +
+                               std::to_string(value.refresh) + " " +
+                               std::to_string(value.retry) + " " +
+                               std::to_string(value.expire) + " " +
+                               std::to_string(value.minimum);
+                    } else if constexpr (std::is_same_v<T, srv_record_data>) {
+                        return std::to_string(value.priority) + " " +
+                               std::to_string(value.weight) + " " +
+                               std::to_string(value.port) + " " +
+                               value.target;
+                    } else if constexpr (std::is_same_v<T, ptr_record_data>) {
+                        return value.ptrname;
+                    } else if constexpr (std::is_same_v<T, caa_record_data>) {
+                        return std::to_string(value.flags) + " " + value.tag + " " + value.value;
+                    } else if constexpr (std::is_same_v<T, generic_record_data>) {
+                        std::ostringstream oss;
+                        oss << value.type << " ";
+                        for (uint8_t byte : value.raw) {
+                            oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+                        }
+                        return oss.str();
+                    } else {
+                        return "";
+                    }
+                }, record.data);
+            }
         };
 
         using dns_selector = std::variant<std::monostate, std::string, dns_record_type>;
@@ -2188,26 +2247,26 @@ namespace ssock::network
                     throw parsing_error("dns_nameserver(): at least one IP address must be provided");
                 }
             }
-            std::vector<std::string> get_ipv4() const {
+            [[nodiscard]] std::vector<std::string> get_ipv4() const {
                 if (!has_ipv4()) {
                     throw parsing_error("dns_nameserver(): no IPv4 addresses available");
                 }
                 return ipv4;
             }
-            std::vector<std::string> get_ipv6() const {
+            [[nodiscard]] std::vector<std::string> get_ipv6() const {
                 if (!has_ipv6()) {
                     throw parsing_error("dns_nameserver(): no IPv6 addresses available");
                 }
                 return ipv6;
             }
-            bool has_ipv4() const noexcept {
+            [[nodiscard]] bool has_ipv4() const noexcept {
                 return !ipv4.empty();
             }
-            bool has_ipv6() const noexcept {
+            [[nodiscard]] bool has_ipv6() const noexcept {
                 return !ipv6.empty();
             }
         };
-#ifdef SSOCK_UNIX
+#if defined(SSOCK_UNIX) && !defined(SSOCK_MACOS)
         [[nodiscard]] inline dns_nameserver_list get_nameservers() {
             if (!std::filesystem::exists("/etc/resolv.conf")) {
                 throw parsing_error("dns_nameserver(): /etc/resolv.conf does not exist");
@@ -2244,7 +2303,44 @@ namespace ssock::network
                 }
             }
 
-            return dns_nameserver_list(std::move(ipv4_addrs), std::move(ipv6_addrs));
+            return {std::move(ipv4_addrs), std::move(ipv6_addrs)};
+        }
+#endif
+#ifdef SSOCK_MACOS
+        [[nodiscard]] inline dns_nameserver_list get_nameservers() {
+            SCDynamicStoreRef store = SCDynamicStoreCreate(nullptr, CFSTR("DNSReader"), nullptr, nullptr);
+            if (!store) {
+                throw parsing_error("failed to create SCDynamicStore");
+            }
+
+            auto dns_dict = static_cast<CFDictionaryRef>(SCDynamicStoreCopyValue(store, CFSTR("State:/Network/Global/DNS")));
+            if (!dns_dict) {
+                CFRelease(store);
+                throw parsing_error("failed to get DNS configuration");
+            }
+
+            auto servers = static_cast<CFArrayRef>(CFDictionaryGetValue(dns_dict, CFSTR("ServerAddresses")));
+            dns_nameserver_list result;
+
+            if (servers && CFGetTypeID(servers) == CFArrayGetTypeID()) {
+                CFIndex count = CFArrayGetCount(servers);
+                for (CFIndex i = 0; i < count; ++i) {
+                    auto cf_ip = static_cast<CFStringRef>(CFArrayGetValueAtIndex(servers, i));
+                    char ip_buf[256];
+                    if (CFStringGetCString(cf_ip, ip_buf, sizeof(ip_buf), kCFStringEncodingUTF8)) {
+                        std::string ip(ip_buf);
+                        if (is_ipv4(ip)) {
+                            result.ipv4.push_back(ip);
+                        } else if (is_ipv6(ip)) {
+                            result.ipv6.push_back(ip);
+                        }
+                    }
+                }
+            }
+
+            CFRelease(dns_dict);
+            CFRelease(store);
+            return result;
         }
 #endif
 #ifdef SSOCK_WINDOWS
@@ -2331,7 +2427,10 @@ namespace ssock::network
         public:
             explicit dns_query_builder(uint16_t _id = 0): id(_id) {
                 if (id == 0) {
-                    this->id = static_cast<uint16_t>(rand() & 0xFFFF);
+                    static std::random_device rd;
+                    static std::mt19937 gen(rd());
+                    std::uniform_int_distribution<uint16_t> dis(1, 0xFFFF);
+                    this->id = dis(gen);
                 }
 
                 packet.resize(12);
@@ -2454,34 +2553,171 @@ namespace ssock::network
                     rec.record_class = record_class;
                     rec.ttl = ttl;
 
-                    if (type == 1 && rdlength == 4) {
+                    if (type == 1 && rdlength == 4) { // A
                         char ipbuf[INET_ADDRSTRLEN];
                         inet_ntop(AF_INET, &data[offset], ipbuf, sizeof(ipbuf));
                         rec.type = network::dns::dns_record_type::A;
                         rec.data = network::dns::a_record_data{{std::string(ipbuf), ""}};
-                    } else if (type == 28 && rdlength == 16) {
+                    } else if (type == 28 && rdlength == 16) { // AAAA
                         char ipbuf[INET6_ADDRSTRLEN];
                         inet_ntop(AF_INET6, &data[offset], ipbuf, sizeof(ipbuf));
                         rec.type = network::dns::dns_record_type::AAAA;
                         rec.data = network::dns::aaaa_record_data{{"", std::string(ipbuf)}};
-                    } else { // TODO: Implement support for other records than A and AAAA.
+                    } else if (type == 5) { // CNAME
+                        auto saved_offset = offset;
+                        std::string cname_target = decode_name(offset);
+                        rec.type = network::dns::dns_record_type::CNAME;
+                        rec.data = network::dns::cname_record_data{std::move(cname_target)};
+                        offset = saved_offset + rdlength;
+                    } else if (type == 15) {
+                        // MX
+                        if (rdlength < 3) throw parsing_error("malformed MX record");
+
+                        uint16_t preference = (data[offset] << 8) | data[offset + 1];
+                        auto saved_offset = offset;
+                        std::string exchange = decode_name(offset + 2);
+                        rec.type = network::dns::dns_record_type::MX;
+                        rec.data = network::dns::mx_record_data{preference, std::move(exchange)};
+                        offset = saved_offset + rdlength;
+                    } else if (type == 2) {
+                        auto saved_offset = offset;
+                        std::string nsdname = decode_name(offset);
+                        rec.type = network::dns::dns_record_type::NS;
+                        rec.data = network::dns::ns_record_data{std::move(nsdname)};
+                        offset = saved_offset + rdlength;
+                    } else if (type == 16) {
+                        // TXT
+                        std::vector<std::string> texts;
+                        size_t end = offset + rdlength;
+                        while (offset < end) {
+                            uint8_t txt_len = data[offset++];
+                            if (offset + txt_len > end) {
+                                throw parsing_error("TXT record string length out of bounds");
+                            }
+                            texts.emplace_back(reinterpret_cast<const char*>(&data[offset]), txt_len);
+                            offset += txt_len;
+                        }
+                        rec.type = network::dns::dns_record_type::TXT;
+                        rec.data = network::dns::txt_record_data{std::move(texts)};
+                    } else if (type == 33) {
+                        // SRV
+                        if (rdlength < 6) {
+                            throw parsing_error("SRV record too short");
+                        }
+
+                        uint16_t priority = read_uint16();
+                        uint16_t weight = read_uint16();
+                        uint16_t port = read_uint16();
+
+                        std::string target = decode_name();
+
+                        rec.type = network::dns::dns_record_type::SRV;
+                        rec.data = network::dns::srv_record_data{priority, weight, port, std::move(target)};
+                    } else if (type == 12) {
+                        // PTR
+                        std::string ptr_name = decode_name();
+                        rec.type = network::dns::dns_record_type::PTR;
+                        rec.data = network::dns::ptr_record_data{std::move(ptr_name)};
+                    } else if (type == 6) { // SOA
+                        std::string mname = decode_name();
+                        std::string rname = decode_name();
+
+                        uint32_t serial = read_uint32();
+                        uint32_t refresh = read_uint32();
+                        uint32_t retry = read_uint32();
+                        uint32_t expire = read_uint32();
+                        uint32_t minimum = read_uint32();
+
+                        rec.type = network::dns::dns_record_type::SOA;
+                        rec.data = network::dns::soa_record_data{
+                            std::move(mname),
+                            std::move(rname),
+                            serial,
+                            refresh,
+                            retry,
+                            expire,
+                            minimum
+                        };
+                    } else {
                         rec.type = network::dns::dns_record_type::OTHER;
-                        rec.data = network::dns::generic_record_data{type, std::vector<uint8_t>{data.begin() + offset, data.begin() + offset + rdlength}};
+                        rec.data = network::dns::generic_record_data{
+                            type, std::vector<uint8_t>{data.begin() + static_cast<long>(offset), data.begin() + static_cast<long>(offset) + rdlength}
+                        };
+                        offset += rdlength;
                     }
 
-                    offset += rdlength;
                     results.push_back(std::move(rec));
                 }
+
 
                 return results;
             }
         };
 
+        class basic_dns_cache {
+        public:
+            basic_dns_cache() = default;
+            virtual ~basic_dns_cache() = default;
+            [[nodiscard]] virtual std::vector<network::dns::dns_record> lookup(const std::string& hostname) const = 0;
+            virtual void store(const std::string& hostname, const std::vector<network::dns::dns_record>& records) = 0;
+        };
+
+        class standard_dns_cache : basic_dns_cache {
+            static std::string get_standard_location() {
+                const std::string cache_filename = "dns_cache";
+                const std::string folder_name = "ssock";
+
+                std::filesystem::path base_path;
+
+#ifdef SSOCK_WINDOWS
+                char* appdata = nullptr;
+                size_t len = 0;
+                _dupenv_s(&appdata, &len, "LOCALAPPDATA");
+                if (appdata && *appdata) {
+                    base_path = appdata;
+                    free(appdata);
+                } else {
+                    base_path = std::filesystem::temp_directory_path();
+                }
+                base_path /= folder_name;
+
+#elifdef SSOCK_MACOS
+                if (const char* home = std::getenv("HOME")) {
+                    base_path = std::filesystem::path(home) / "Library" / "Caches" / folder_name;
+                } else {
+                    base_path = std::filesystem::temp_directory_path();
+                }
+
+#elifdef SSOCK_UNIX
+                const char* xdg = std::getenv("XDG_CACHE_HOME");
+                if (xdg) {
+                    base_path = std::filesystem::path(xdg) / folder_name;
+                } else if (const char* home = std::getenv("HOME")) {
+                    base_path = std::filesystem::path(home) / ".cache" / folder_name;
+                } else {
+                    base_path = std::filesystem::temp_directory_path();  // fallback
+                }
+#else
+#error "Unsupported platform for DNS cache location; write your own derivitive class"
+#endif
+
+                std::filesystem::create_directories(base_path);
+                return (base_path / cache_filename).string();
+            }
+        public:
+            [[nodiscard]] std::vector<network::dns::dns_record> lookup(const std::string& hostname) const override {
+                throw std::runtime_error{"Not implemented."};
+            }
+            void store(const std::string& hostname, const std::vector<network::dns::dns_record>& records) override {
+                throw std::runtime_error{"Not implemented."};
+            }
+        };
+
         class basic_sync_dns_resolver {
         public:
-            [[nodiscard]] sock_ip_list resolve_hostname(const std::string& hostname) const;
+            [[nodiscard]] virtual sock_ip_list resolve_hostname(const std::string& hostname) const = 0;
             explicit basic_sync_dns_resolver() = default;
-            explicit basic_sync_dns_resolver(dns_nameserver_list list) {};
+            explicit basic_sync_dns_resolver(const dns_nameserver_list&) {};
             virtual ~basic_sync_dns_resolver() = default;
         };
 
@@ -2495,13 +2731,13 @@ namespace ssock::network
                 throw parsing_error("sync_dns_resolver(): at least one IP address must be provided");
             }
         public:
-            sync_dns_resolver(const dns_nameserver_list& list) : list(list) {
+            explicit sync_dns_resolver(dns_nameserver_list list) : list(std::move(list)) {
                 throw_if_invalid();
             }
             sync_dns_resolver() : list(get_nameservers()) {
                 throw_if_invalid();
             }
-            [[nodiscard]] sock_ip_list resolve_hostname(const std::string& hostname) {
+            [[nodiscard]] sock_ip_list resolve_hostname(const std::string& hostname) const override {
                 if (is_ipv4(hostname)) {
                     return sock_ip_list{hostname, ""};
                 } else if (is_ipv6(hostname)) {
