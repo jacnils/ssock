@@ -436,7 +436,7 @@ namespace ssock::utility {
             {".7z", "application/x-7z-compressed"},
         };
 
-        if (content_type_map.find(file) != content_type_map.end()) {
+        if (content_type_map.contains(file)) {
             return content_type_map.at(file);
         } else {
             return "application/octet-stream";
@@ -1356,7 +1356,7 @@ namespace ssock::sock {
                     auto ip_list = resolver.resolve_hostname(p);
                     auto ip = t ? ip_list.get_ipv6() : ip_list.get_ipv4();
                     return ip;
-                } catch (const std::exception& ex) {
+                } catch (const std::exception&) {
                     return {};
                 }
             };
@@ -2341,9 +2341,12 @@ namespace ssock::http {
             constexpr auto HEADER_END = "\r\n\r\n";
             const auto pos = input.find(HEADER_END);
             if (pos == std::string::npos) {
-                throw parsing_error("no header terminator");
+                throw parsing_error("no header terminator; invalid HTTP body");
             }
-            this->body = input.substr(pos + strlen(HEADER_END));
+
+            if (pos + strlen(HEADER_END) < input.length()) {
+                this->body = input.substr(pos + strlen(HEADER_END));
+            }
 
             std::string line{};
             std::istringstream hs(input.substr(0, pos));
@@ -2764,6 +2767,8 @@ namespace ssock::http {
             bool trust_x_forwarded_for{false};
             int max_connections{-1};
             bool session_is_secure{true};
+            std::function<std::unordered_map<std::string, std::string>(const std::string&)> read_from_session_file = nullptr;
+            std::function<void(const std::string&, const std::unordered_map<std::string, std::string>&)> write_to_session_file = nullptr;
         };
 
         /**
@@ -2802,11 +2807,21 @@ namespace ssock::http {
             std::vector<header> headers{};
         };
 
-        /**
-         * @brief  Class that represents a server.
-         */
-        template <typename T = http::body_parser<std::string>>
-        class sync_server {
+        using request_callback = std::function<response(const request&)>;
+
+        template <typename T = http::body_parser<std::string>,
+                  typename S = server_settings>
+        class basic_request_handler {
+        public:
+            basic_request_handler() = default;
+            virtual void handle(std::unique_ptr<sock::sync_sock>&, server_settings&, const request_callback&) const = 0;
+            virtual ~basic_request_handler() = default;
+        };
+
+        template <typename T = http::body_parser<std::string>,
+                  typename S = server_settings
+                 >
+        class request_handler : basic_request_handler<> {
             static std::vector<cookie> get_cookies_from_request(const std::string& cookie_header) {
                 std::vector<cookie> cookies;
                 std::string cookie_str = cookie_header + ";";
@@ -2829,7 +2844,7 @@ namespace ssock::http {
                 return cookies;
             }
 
-            static std::unordered_map<std::string, std::string> read_from_session_file(const std::string& f) {
+            static std::unordered_map<std::string, std::string> default_read_from_session_file(const std::string& f) {
                 std::unordered_map<std::string, std::string> session;
 
                 std::ifstream file(f);
@@ -2858,7 +2873,7 @@ namespace ssock::http {
                 return session;
             }
 
-            static void write_to_session_file(const std::string& f, const std::unordered_map<std::string, std::string>& session) {
+            static void default_write_to_session_file(const std::string& f, const std::unordered_map<std::string, std::string>& session) {
                 auto directory = std::filesystem::path(f).parent_path();
                 if (!std::filesystem::exists(directory)) {
                     std::filesystem::create_directories(directory);
@@ -2875,46 +2890,17 @@ namespace ssock::http {
 
                 file.close();
             }
-
-            server_settings settings;
-            std::function<response(const request&)> callback;
-            std::unique_ptr<sock::sync_sock> sock;
         public:
-            /**
-             * @brief  Constructor for the server class
-             * @param  settings The settings for the server
-             * @param  callback The function to call when a request is made
-             */
-            sync_server(server_settings settings, const std::function<response(const request&)>& callback)
-                : settings(std::move(settings)), callback(callback)
-            {
-                if (!ssock::network::is_valid_port(settings.port)) {
-                    throw parsing_error("invalid port");
-                }
-
-                sock::sock_addr addr = {"localhost", settings.port, ssock::sock::sock_addr_type::hostname};
-                this->sock = std::make_unique<sock::sync_sock>(addr, ssock::sock::sock_type::tcp, ssock::sock::sock_opt::reuse_addr|ssock::sock::sock_opt::no_delay|ssock::sock::sock_opt::blocking);
-
-                try {
-                    sock->bind();
-                } catch (const std::exception&) {
-                    throw socket_error("failed to bind socket, port might be in use");
-                }
-                sock->listen(settings.max_connections);
-            };
-            ~sync_server() {
-                sock->close();
-            }
-
-            /**
-             * @brief  Run the server and attempt to accept an incoming connection
-             * @note Call this function in a loop to keep the server running.
-             */
-            void accept() {
-                auto client_sock = sock->accept();
-
+            void handle(std::unique_ptr<sock::sync_sock>& client_sock, server_settings& settings, const request_callback& callback) const override {
                 if (!client_sock) {
                     return;
+                }
+
+                if (settings.read_from_session_file == nullptr) {
+                    settings.read_from_session_file = default_read_from_session_file;
+                }
+                if (settings.write_to_session_file == nullptr) {
+                    settings.write_to_session_file = default_write_to_session_file;
                 }
 
                 request req{};
@@ -3087,7 +3073,7 @@ namespace ssock::http {
                 if (session_id_found) {
                     std::erase(session_id, '/');
                     std::filesystem::path session_file = settings.session_directory + "/session_" + session_id + ".txt";
-                    req.session = read_from_session_file(session_file.string());
+                    req.session = settings.read_from_session_file(session_file.string());
                     req.session_id = session_id;
 
                     if (!std::filesystem::exists(session_file)) {
@@ -3104,7 +3090,7 @@ namespace ssock::http {
                         }
                         req.cookies.erase(
                             std::remove_if(req.cookies.begin(), req.cookies.end(),
-                                           [this](const cookie& cookie) {
+                                           [this, &settings](const cookie& cookie) {
                                                return cookie.name == settings.session_cookie_name;
                                            }),
                             req.cookies.end()
@@ -3113,7 +3099,7 @@ namespace ssock::http {
                         req.session.clear();
                         req.session_id.clear();
                     } else {
-                        req.session = read_from_session_file(session_file.string());
+                        req.session = settings.read_from_session_file(session_file.string());
                         req.session_id = session_id;
                     }
                 }
@@ -3142,13 +3128,13 @@ namespace ssock::http {
                     response.cookies.push_back({.name = settings.session_cookie_name, .value = session_id, .expires = 0, .path = "/", .same_site = "Strict", .http_only = true, .secure = settings.session_is_secure});
                 } else if (settings.enable_session) {
                     std::string session_file = settings.session_directory + "/session_" + session_id + ".txt";
-                    std::unordered_map<std::string, std::string> stored = read_from_session_file(session_file);
+                    std::unordered_map<std::string, std::string> stored = settings.read_from_session_file(session_file);
 
                     for (const auto& it : response.session) {
                         stored[it.first] = it.second;
                     }
 
-                    write_to_session_file(session_file, stored);
+                    settings.write_to_session_file(session_file, stored);
                 }
 
                 for (const auto& it : response.cookies) {
@@ -3213,6 +3199,58 @@ namespace ssock::http {
 
                 client_sock->send(net_response.str());
                 client_sock->close();
+            }
+        };
+
+        /**
+         * @brief  Class that represents a server.
+         */
+        template <typename T = request_handler<>>
+        class sync_server {
+            server_settings settings;
+            std::function<response(const request&)> callback;
+            std::unique_ptr<sock::sync_sock> sock;
+        public:
+            /**
+             * @brief  Constructor for the server class
+             * @param  settings The settings for the server
+             * @param  callback The function to call when a request is made
+             */
+            sync_server(server_settings settings, const std::function<response(const request&)>& callback)
+                : settings(std::move(settings)), callback(callback)
+            {
+                if (!ssock::network::is_valid_port(settings.port)) {
+                    throw parsing_error("invalid port");
+                }
+
+                sock::sock_addr addr = {"localhost", settings.port, ssock::sock::sock_addr_type::hostname};
+                this->sock = std::make_unique<sock::sync_sock>(addr, ssock::sock::sock_type::tcp, ssock::sock::sock_opt::reuse_addr|ssock::sock::sock_opt::no_delay|ssock::sock::sock_opt::blocking);
+
+                try {
+                    sock->bind();
+                } catch (const std::exception&) {
+                    throw socket_error("failed to bind socket, port might be in use");
+                }
+                sock->listen(settings.max_connections);
+            };
+            ~sync_server() {
+                sock->close();
+            }
+
+            /**
+             * @brief  Accept a connection and handle the request using the provided handler
+             * @param  handler The handler to use for processing the request
+             */
+            void accept(const T& handler) {
+                auto client_sock = sock->accept();
+                handler.handle(client_sock, settings, callback);
+            }
+            /**
+             * @brief  Run the server and attempt to accept an incoming connection
+             * @note Call this function in a loop to keep the server running.
+             */
+            void accept() {
+                this->accept(T{});
             }
         };
     }
