@@ -2341,9 +2341,12 @@ namespace ssock::http {
             constexpr auto HEADER_END = "\r\n\r\n";
             const auto pos = input.find(HEADER_END);
             if (pos == std::string::npos) {
-                throw parsing_error("no header terminator");
+                throw parsing_error("no header terminator; invalid HTTP body");
             }
-            this->body = input.substr(pos + strlen(HEADER_END));
+
+            if (pos + strlen(HEADER_END) < input.length()) {
+                this->body = input.substr(pos + strlen(HEADER_END));
+            }
 
             std::string line{};
             std::istringstream hs(input.substr(0, pos));
