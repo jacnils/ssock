@@ -34,6 +34,7 @@
 #if defined(__unix__) || defined(__unix) || defined(__APPLE__) && defined(__MACH__)
 #define SSOCK_UNIX
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -49,6 +50,7 @@
 #include <ws2tcpip.h>
 #include <windns.h>
 #include <iphlpapi.h>
+#include <afunix.h>
 
 static constexpr int ns_t_a{1};
 static constexpr int ns_t_ns{2};
@@ -491,6 +493,7 @@ namespace ssock::network {
         hostname_ipv4 = 2, /* Hostname; resolve to IPv4 address */
         hostname_ipv6 = 3, /* Hostname; resolve to IPv6 address */
         hostname = 4, /* Hostname; resolve to IPv4 address */
+        filename = 5 /* File path; used for Unix domain sockets */
     };
 
     /**
@@ -1313,6 +1316,7 @@ namespace ssock::sock {
     enum class sock_type {
         tcp, /* TCP socket */
         udp, /* UDP socket */
+        unix, /* UNIX domain socket */
     };
     /**
      * @brief Socket options.
@@ -1353,6 +1357,7 @@ namespace ssock::sock {
      * @param t The address type (ipv4, ipv6, hostname_ipv4, hostname_ipv6).
      */
     class sock_addr final {
+        std::filesystem::path path{};
         std::string hostname{};
         std::string ip{};
         int port{};
@@ -1415,7 +1420,16 @@ namespace ssock::sock {
                 this->hostname.clear();
             }
         }
-
+        /**
+         * @brief Constructs a sock_addr object for a file path.
+         * @param path The file path to use.
+         * @throws parsing_error if the path does not exist.
+         */
+        sock_addr(const std::filesystem::path& path) : path(path), type(sock_addr_type::filename) {
+            if (!std::filesystem::exists(path)) {
+                throw parsing_error("sock_addr(): path does not exist");
+            }
+        }
         /**
          * @brief Check whether the address is IPv4 or IPv6.
          * @return True if the address is IPv4, false if it is IPv6 or invalid.
@@ -1431,30 +1445,32 @@ namespace ssock::sock {
             return type == sock_addr_type::ipv6;
         }
         /**
-         * @brief Get the stored IP address.
-         * @return The stored IP address.
-         * @note Reference
+         * @brief Check whether the address is a file path.
+         * @return True if the address is a file path, false if it is an IP address, hostname or invalid.
          */
-        std::string& get_ip() {
-            return this->ip;
+        [[nodiscard]] bool is_file_path() const noexcept {
+            return type == sock_addr_type::filename;
         }
         /**
          * @brief Get the stored IP address.
          * @return The stored IP address.
          */
         [[nodiscard]] std::string get_ip() const noexcept {
+            if (type == sock_addr_type::filename) {
+                throw parsing_error("sock_addr(): cannot get IP from a file path");
+            }
+
             return this->ip;
         }
         /**
-         * @brief Get the stored hostname.
-         * @return The stored hostname.
-         * @note Reference
+         * @brief Get the stored file path.
+         * @return The stored file path.
          */
-        std::string& get_hostname() {
-            if (hostname.empty()) {
-                throw parsing_error("hostname is empty, use get_ip() instead");
+        [[nodiscard]] std::filesystem::path get_path() const {
+            if (type != sock_addr_type::filename) {
+                throw parsing_error("sock_addr(): cannot get path from an IP address or hostname");
             }
-            return hostname;
+            return this->path;
         }
         /**
          * @brief Get the stored hostname.
@@ -1464,6 +1480,9 @@ namespace ssock::sock {
             if (hostname.empty()) {
                 throw parsing_error("hostname is empty, use get_ip() instead");
             }
+            if (type == sock_addr_type::filename) {
+                throw parsing_error("sock_addr(): cannot get hostname from a file path");
+            }
             return hostname;
         }
         /**
@@ -1471,6 +1490,10 @@ namespace ssock::sock {
          * @return The stored port.
          */
         [[nodiscard]] int get_port() const noexcept {
+            if (type == sock_addr_type::filename) {
+                throw parsing_error("sock_addr(): cannot get port from a file path");
+            }
+
             return port;
         }
         ~sock_addr() = default;
@@ -1519,6 +1542,10 @@ namespace ssock::sock {
         [[nodiscard]] socklen_t get_sa_len() const {
             if (addr.is_ipv4()) return sizeof(sockaddr_in);
             if (addr.is_ipv6()) return sizeof(sockaddr_in6);
+            if (addr.is_file_path()) {
+                const auto& path = addr.get_path();
+                return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.string().size() + 1);
+            }
 
             throw socket_error("invalid address type");
         }
@@ -1539,30 +1566,21 @@ namespace ssock::sock {
                 if (inet_pton(AF_INET6, addr.get_ip().c_str(), &sa6->sin6_addr) <= 0) {
                     throw parsing_error("invalid IPv6 address");
                 }
+            } else if (addr.is_file_path()) {
+                auto* sa_un = reinterpret_cast<sockaddr_un*>(&sa_storage);
+                sa_un->sun_family = AF_UNIX;
+                const auto& path = addr.get_path().string();
+                if (path.size() >= sizeof(sa_un->sun_path)) {
+                    throw socket_error("UNIX socket path too long");
+                }
+                std::memcpy(sa_un->sun_path, path.c_str(), path.size() + 1);
             } else {
                 throw ip_error("invalid address type");
             }
         }
-    public:
-        /**
-         * @brief Constructs a sync_sock object.
-         * @param addr The socket address to bind to.
-         * @param t The socket type (tcp or udp).
-         * @param opts The socket options (reuse_addr, no_reuse_addr).
-         */
+
 #ifdef SSOCK_UNIX
-        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
-            if (addr.get_ip().empty()) {
-                throw socket_error("IP address is empty");
-            }
-
-            this->sockfd = internal_net::sys_net_socket(addr.is_ipv6() ? AF_INET6 : AF_INET,
-                                                              t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
-
-            if (this->sockfd < 0) {
-                throw socket_error("failed to create socket");
-            }
-
+        void set_sock_opts(sock_opt opts) const {
             if (opts & sock_opt::reuse_addr) {
                 internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opts, sizeof(opts));
             } else if (opts & sock_opt::no_reuse_addr) {
@@ -1597,73 +1615,112 @@ namespace ssock::sock {
                     throw socket_error("failed to set socket to blocking mode");
                 }
             }
-
-            this->prep_sa();
         }
 #endif
 #ifdef SSOCK_WINDOWS
-        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
-            if (addr.get_ip().empty()) {
-                throw socket_error("IP address is empty");
-            }
-
-            this->sockfd = socket(
-                addr.is_ipv6() ? AF_INET6 : AF_INET,
-                t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM,
-                IPPROTO_IP
-            );
-
-            if (this->sockfd == INVALID_SOCKET) {
-                throw socket_error("Failed to create socket");
-            }
-
+        void set_sock_opts(sock_opt opts) {
             if (opts & sock_opt::reuse_addr) {
                 BOOL optval = TRUE;
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set SO_REUSEADDR");
+                    throw socket_error("failed to set SO_REUSEADDR");
                 }
             } else if (opts & sock_opt::no_reuse_addr) {
                 BOOL optval = FALSE;
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to clear SO_REUSEADDR");
+                    throw socket_error("failed to clear SO_REUSEADDR");
                 }
             }
             if (opts & sock_opt::no_delay) {
                 BOOL optval = TRUE;
                 if (setsockopt(this->sockfd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set TCP_NODELAY");
+                    throw socket_error("failed to set TCP_NODELAY");
                 }
             }
             if (opts & sock_opt::keep_alive) {
                 BOOL optval = TRUE;
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set SO_KEEPALIVE");
+                    throw socket_error("failed to set SO_KEEPALIVE");
                 }
             } else if (opts & sock_opt::no_keep_alive) {
                 BOOL optval = FALSE;
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to clear SO_KEEPALIVE");
+                    throw socket_error("failed to clear SO_KEEPALIVE");
                 }
             }
             if (opts & sock_opt::no_blocking) {
                 u_long mode = 1;
                 if (ioctlsocket(this->sockfd, FIONBIO, &mode) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set socket to non-blocking mode");
+                    throw socket_error("failed to set socket to non-blocking mode");
                 }
             } else if (opts & sock_opt::blocking) {
                 u_long mode = 0;
                 if (ioctlsocket(this->sockfd, FIONBIO, &mode) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set socket to blocking mode");
+                    throw socket_error("failed to set socket to blocking mode");
                 }
             }
+        }
+#endif
+    public:
+        /**
+         * @brief Constructs a sync_sock object.
+         * @param addr The socket address to bind to.
+         * @param t The socket type (tcp, udp, unix).
+         * @param opts The socket options (reuse_addr, no_reuse_addr).
+         */
+#ifdef SSOCK_UNIX
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
+            if (addr.get_ip().empty() && !addr.is_file_path()) {
+                throw socket_error("IP address/file path is empty");
+            }
 
+            if (t != sock_type::unix) {
+                this->sockfd = internal_net::sys_net_socket(addr.is_ipv6() ? AF_INET6 : AF_INET,
+                                                                  t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
+            } else {
+                this->sockfd = internal_net::sys_net_socket(AF_UNIX, SOCK_STREAM, 0);
+            }
+
+            if (this->sockfd < 0) {
+                throw socket_error("failed to create socket");
+            }
+
+            this->set_sock_opts(opts);
+            this->prep_sa();
+        }
+#endif
+#ifdef SSOCK_WINDOWS
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking)
+            : addr(addr), type(t) {
+
+            if (addr.get_ip().empty() && !addr.is_file_path()) {
+                throw socket_error("IP address or file path is empty");
+            }
+
+            int domain = AF_UNIX;
+            int sock_type = SOCK_STREAM;
+            int protocol = 0;
+
+            if (t != sock_type::unix) {
+                domain = addr.is_ipv6() ? AF_INET6 : AF_INET;
+                sock_type = (t == sock_type::tcp) ? SOCK_STREAM : SOCK_DGRAM;
+                protocol = (t == sock_type::tcp) ? IPPROTO_TCP : IPPROTO_UDP;
+            } else {
+                protocol = 0;
+            }
+
+            this->sockfd = socket(domain, sock_type, protocol);
+            if (this->sockfd == INVALID_SOCKET) {
+                throw socket_error("Failed to create socket");
+            }
+
+            this->set_sock_opts(opts);
             this->prep_sa();
         }
 #endif
