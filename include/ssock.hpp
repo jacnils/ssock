@@ -750,63 +750,9 @@ namespace ssock::network {
         struct dns_record {
             std::string name;
             dns_record_type type{};
-            uint16_t record_class = 1;
+            uint16_t record_class{1};
             uint32_t ttl{};
             dns_record_data data;
-
-            static std::string serialize_record_data(const dns_record& record) {
-                return std::visit([&]<typename T0>(const T0& value) -> std::string {
-                    using T = std::decay_t<T0>;
-                    if constexpr (std::is_same_v<T, a_record_data> || std::is_same_v<T, aaaa_record_data>) {
-                        std::ostringstream oss;
-                        for (const auto& ip : value.ip) {
-                            oss << ip << ",";
-                        }
-                        std::string result = oss.str();
-                        if (!result.empty()) result.pop_back(); // remove last comma
-                        return result;
-                    } else if constexpr (std::is_same_v<T, cname_record_data>) {
-                        return value.cname;
-                    } else if constexpr (std::is_same_v<T, mx_record_data>) {
-                        return std::to_string(value.preference) + " " + value.exchange;
-                    } else if constexpr (std::is_same_v<T, ns_record_data>) {
-                        return value.ns;
-                    } else if constexpr (std::is_same_v<T, txt_record_data>) {
-                        std::ostringstream oss;
-                        for (const auto& txt : value.text) {
-                            oss << "\"" << txt << "\" ";
-                        }
-                        std::string result = oss.str();
-                        if (!result.empty()) result.pop_back(); // remove last space
-                        return result;
-                    } else if constexpr (std::is_same_v<T, soa_record_data>) {
-                        return value.mname + " " + value.rname + " " +
-                               std::to_string(value.serial) + " " +
-                               std::to_string(value.refresh) + " " +
-                               std::to_string(value.retry) + " " +
-                               std::to_string(value.expire) + " " +
-                               std::to_string(value.minimum);
-                    } else if constexpr (std::is_same_v<T, srv_record_data>) {
-                        return std::to_string(value.priority) + " " +
-                               std::to_string(value.weight) + " " +
-                               std::to_string(value.port) + " " +
-                               value.target;
-                    } else if constexpr (std::is_same_v<T, ptr_record_data>) {
-                        return value.ptrname;
-                    } else if constexpr (std::is_same_v<T, caa_record_data>) {
-                        return std::to_string(value.flags) + " " + value.tag + " " + value.value;
-                    } else if constexpr (std::is_same_v<T, generic_record_data>) {
-                        std::ostringstream oss;
-                        oss << value.type << " ";
-                        for (uint8_t byte : value.raw) {
-                            oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
-                        }
-                        return oss.str();
-                    } else {
-                        return "";
-                    }
-                }, record.data);
-            }
         };
 
         using dns_selector = std::variant<std::monostate, std::string, dns_record_type>;
