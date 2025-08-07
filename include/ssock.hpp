@@ -2387,7 +2387,7 @@ namespace ssock::sock {
                 FD_ZERO(&readfds);
                 FD_SET(this->sockfd, &readfds);
 
-                int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr, &tv);
+                int ret = ::select(this->sockfd + 1, &readfds, nullptr, nullptr, &tv);
                 if (ret == SOCKET_ERROR) {
                     throw socket_error("select() failed");
                 }
@@ -2402,7 +2402,7 @@ namespace ssock::sock {
                     }
 
                     char buf[8192];
-                    int received = internal_net::sys_net_recv(this->sockfd, buf, static_cast<int>(bytes_to_read), 0);
+                    int received = ::recv(this->sockfd, buf, static_cast<int>(bytes_to_read), 0);
                     if (received == SOCKET_ERROR) {
                         int err = WSAGetLastError();
                         if (err == WSAEINTR) continue;
