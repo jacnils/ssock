@@ -14,15 +14,13 @@ Simple library providing modernized, safe Unix-style sockets, HTTP abstraction, 
 - Inheritable classes for easy extension
 - C++23
 - Support for Windows, Linux, macOS and other Unix-compatible systems.
-- No dependencies*
+- No dependencies\*
 
-*DNS resolution requires resolv, and you may need to link against it on some systems.
+\*aside from system level dependencies, which are usually already installed on most systems.
 
 Still missing:
 
-- Custom DNS resolver (needs to be implemented before async)
 - Asynchronous sockets
-- SSL/TLS support (would require external dependencies)
 
 ## Dependencies
 

@@ -24,11 +24,23 @@
 #ifndef SSOCK
 #define SSOCK 1
 #endif
-// SSOCK_DEBUG
+
+#define SSOCK_FALLBACK_IPV4_DNS_1 "8.8.8.8"
+#define SSOCK_FALLBACK_IPV4_DNS_2 "8.8.4.4"
+#define SSOCK_FALLBACK_IPV6_DNS_1 "2001:4860:4860::8888"
+#define SSOCK_FALLBACK_IPV6_DNS_2 "2001:4860:4860::8844"
+#define SSOCK_LOCALHOST_IPV4 "127.0.0.1"
+#define SSOCK_LOCALHOST_IPV6 "::1"
+
+#if defined(__APPLE__)
+#define SSOCK_MACOS
+#include <SystemConfiguration/SystemConfiguration.h>
+#endif
 
 #if defined(__unix__) || defined(__unix) || defined(__APPLE__) && defined(__MACH__)
 #define SSOCK_UNIX
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -44,6 +56,7 @@
 #include <ws2tcpip.h>
 #include <windns.h>
 #include <iphlpapi.h>
+#include <afunix.h>
 
 static constexpr int ns_t_a{1};
 static constexpr int ns_t_ns{2};
@@ -61,7 +74,6 @@ namespace ssock::internal_net {
     inline void ensure_winsock_initialized() {
         static bool initialized = [] {
             WSADATA wsaData;
-            std::cout << "WSAStartup called";
             int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
             if (result != 0) {
                 throw std::runtime_error("WSAStartup failed with code " + std::to_string(result));
@@ -463,6 +475,71 @@ namespace ssock::utility {
 
         return buffer;
     }
+
+    template<typename T>
+    static void write(std::ostream& os, const T& val) {
+        os.write(reinterpret_cast<const char*>(&val), sizeof(T));
+    }
+
+    template<typename T>
+    static void read(std::istream& is, T& val) {
+        is.read(reinterpret_cast<char*>(&val), sizeof(T));
+    }
+
+    static void write_string(std::ostream& os, const std::string& str) {
+        auto len = static_cast<uint32_t>(str.size());
+        write(os, len);
+        os.write(str.data(), len);
+    }
+
+    static std::string read_string(std::istream& is) {
+        uint32_t len;
+        read(is, len);
+        std::string str(len, '\0');
+        is.read(&str[0], len);
+        return str;
+    }
+
+    static std::string get_standard_cache_location() {
+        const std::string cache_filename = "dns_cache";
+        const std::string folder_name = "ssock";
+
+        std::filesystem::path base_path;
+
+#ifdef SSOCK_WINDOWS
+        char* appdata = nullptr;
+        size_t len = 0;
+        _dupenv_s(&appdata, &len, "LOCALAPPDATA");
+        if (appdata && *appdata) {
+            base_path = appdata;
+            free(appdata);
+        } else {
+            base_path = std::filesystem::temp_directory_path();
+        }
+        base_path /= folder_name;
+
+#elifdef SSOCK_MACOS
+        if (const char* home = std::getenv("HOME")) {
+            base_path = std::filesystem::path(home) / "Library" / "Caches" / folder_name;
+        } else {
+            base_path = std::filesystem::temp_directory_path();
+        }
+
+#elifdef SSOCK_UNIX
+        const char* xdg = std::getenv("XDG_CACHE_HOME");
+        if (xdg) {
+            base_path = std::filesystem::path(xdg) / folder_name;
+        } else if (const char* home = std::getenv("HOME")) {
+            base_path = std::filesystem::path(home) / ".cache" / folder_name;
+        } else {
+            base_path = std::filesystem::temp_directory_path();  // fallback
+        }
+#else
+#error "Unsupported platform for DNS cache location; write your own derivitive class"
+#endif
+        std::filesystem::create_directories(base_path);
+        return (base_path / cache_filename).string();
+    }
 }
 
 /**
@@ -475,6 +552,31 @@ namespace ssock::network {
     };
 
     /**
+     * @brief A function that checks if a usable IPv6 address exists.
+     * @return True if a usable IPv6 address exists, false otherwise.
+     * @note This function checks the local network interfaces for a usable IPv6 address.
+     */
+    static bool usable_ipv6_address_exists();
+    /**
+     * @brief A function that checks if a string is a valid IPv4 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv4 address, false otherwise.
+     */
+    static bool is_ipv4(const std::string& ip);
+    /**
+     * @brief A function that checks if a string is a valid IPv6 address.
+     * @param ip The string to check.
+     * @return True if the string is a valid IPv6 address, false otherwise.
+     */
+    static bool is_ipv6(const std::string& ip);
+    /**
+     * @brief A function that checks if a port is valid.
+     * @param port The port to check.
+     * @return True if the port is valid, false otherwise.
+     */
+    static bool is_valid_port(int port);
+
+    /**
      * @brief Socket address types.
      * @note Use ipv4/ipv6 for IP addresses, and hostname_ipv4/hostname_ipv6 for hostnames, depending on the address type.
      * @note If you are unsure but have a hostname, use hostname_ipv4.
@@ -485,6 +587,7 @@ namespace ssock::network {
         hostname_ipv4 = 2, /* Hostname; resolve to IPv4 address */
         hostname_ipv6 = 3, /* Hostname; resolve to IPv6 address */
         hostname = 4, /* Hostname; resolve to IPv4 address */
+        filename = 5 /* File path; used for Unix domain sockets */
     };
 
     /**
@@ -507,22 +610,43 @@ namespace ssock::network {
             return !v6.empty();
         }
         [[nodiscard]] std::string get_ipv4() const {
-            if (!this->contains_ipv4()) {
-                throw ip_error("sock_ip_list(): no IPv4 address");
-            }
             return v4;
         }
         [[nodiscard]] std::string get_ipv6() const {
-            if (!this->contains_ipv6()) {
-                throw ip_error("sock_ip_list(): no IPv6 address");
-            }
             return v6;
         }
         [[nodiscard]] std::string get_ip() const {
-            if (v4.empty() && v6.empty()) {
-                throw ip_error("sock_ip_list(): no IP address");
-            }
             return v6.empty() ? v4 : v6;
+        }
+        static sock_ip_list from_ipv4(const std::string& ip) {
+            if (!ssock::network::is_ipv4(ip)) {
+                throw ip_error("sock_ip_list::from_ipv4(): invalid IPv4 address");
+            }
+            return {ip, ""};
+        }
+        static sock_ip_list from_ipv6(const std::string& ip) {
+            if (!ssock::network::is_ipv6(ip)) {
+                throw ip_error("sock_ip_list::from_ipv6(): invalid IPv6 address");
+            }
+            return {"", ip};
+        }
+        static sock_ip_list from_ip(const std::string& ip) {
+            if (ssock::network::is_ipv4(ip)) {
+                return sock_ip_list::from_ipv4(ip);
+            } else if (ssock::network::is_ipv6(ip)) {
+                return sock_ip_list::from_ipv6(ip);
+            } else {
+                throw ip_error("sock_ip_list::from_ip(): invalid IP address");
+            }
+        }
+        static sock_ip_list from_ips(const std::string& ip_v4, const std::string& ip_v6) {
+            if (!ssock::network::is_ipv4(ip_v4) && !ip_v4.empty()) {
+                throw ip_error("sock_ip_list::from_ips(): invalid IPv4 address");
+            }
+            if (!ssock::network::is_ipv6(ip_v6) && !ip_v6.empty()) {
+                throw ip_error("sock_ip_list::from_ips(): invalid IPv6 address");
+            }
+            return {ip_v4, ip_v6};
         }
     };
 
@@ -629,60 +753,79 @@ namespace ssock::network {
             return point_to_point;
         }
     };
-    namespace dns {
+
+    /**
+     * @brief A function that gets the local network interfaces.
+     * @return A vector of network_interface structs that contain the local network interfaces.
+     */
+    inline std::vector<network_interface> get_interfaces();
+
+    namespace dns
+    {
         enum class dns_record_type {
-            A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, PTR, CAA, OTHER
+            A = 1,
+            AAAA = 28,
+            CNAME = 5,
+            MX = 15,
+            NS = 2,
+            TXT = 16,
+            SOA = 6,
+            SRV = 33,
+            PTR = 12,
+            CAA = 257,
+            ANY = 255,
+            OTHER = 0,
         };
 
         struct generic_record_data {
-            uint16_t type;
-            std::vector<uint8_t> raw;
+            uint16_t type{};
+            std::vector<uint8_t> raw{};
         };
 
         struct a_record_data {
-            sock_ip_list ip;
+            sock_ip_list ip{};
         };
 
         struct aaaa_record_data {
-            sock_ip_list ip;
+            sock_ip_list ip{};
         };
 
         struct cname_record_data {
-            std::string cname;
+            std::string cname{};
         };
 
         struct mx_record_data {
-            uint16_t preference;
-            std::string exchange;
+            uint16_t preference{};
+            std::string exchange{};
         };
 
         struct ns_record_data {
-            std::string ns;
+            std::string ns{};
         };
 
         struct txt_record_data {
-            std::vector<std::string> text;
+            std::vector<std::string> text{};
         };
 
         struct soa_record_data {
-            std::string mname;
-            std::string rname;
-            uint32_t serial, refresh, retry, expire, minimum;
+            std::string mname{};
+            std::string rname{};
+            uint32_t serial{}, refresh{}, retry{}, expire{}, minimum{};
         };
 
         struct srv_record_data {
-            uint16_t priority, weight, port;
-            std::string target;
+            uint16_t priority{}, weight{}, port{};
+            std::string target{};
         };
 
         struct ptr_record_data {
-            std::string ptrname;
+            std::string ptrname{};
         };
 
         struct caa_record_data {
-            uint8_t flags;
-            std::string tag;
-            std::string value;
+            uint8_t flags{};
+            std::string tag{};
+            std::string value{};
         };
 
         using dns_record_data = std::variant<
@@ -700,349 +843,563 @@ namespace ssock::network {
             std::monostate
         >;
 
+        inline bool operator==(const a_record_data& lhs, const a_record_data& rhs) {
+            return lhs.ip.get_ipv4() == rhs.ip.get_ipv4() && lhs.ip.get_ipv6() == rhs.ip.get_ipv6();
+        }
+
+        inline bool operator==(const aaaa_record_data& lhs, const aaaa_record_data& rhs) {
+            return lhs.ip.get_ipv4() == rhs.ip.get_ipv4() && lhs.ip.get_ipv6() == rhs.ip.get_ipv6();
+        }
+
+        inline bool operator==(const cname_record_data& lhs, const cname_record_data& rhs) {
+            return lhs.cname == rhs.cname;
+        }
+
+        inline bool operator==(const mx_record_data& lhs, const mx_record_data& rhs) {
+            return lhs.preference == rhs.preference && lhs.exchange == rhs.exchange;
+        }
+
+        inline bool operator==(const ns_record_data& lhs, const ns_record_data& rhs) {
+            return lhs.ns == rhs.ns;
+        }
+
+        inline bool operator==(const txt_record_data& lhs, const txt_record_data& rhs) {
+            return lhs.text == rhs.text;
+        }
+
+        inline bool operator==(const soa_record_data& lhs, const soa_record_data& rhs) {
+            return lhs.mname == rhs.mname &&
+                   lhs.rname == rhs.rname &&
+                   lhs.serial == rhs.serial &&
+                   lhs.refresh == rhs.refresh &&
+                   lhs.retry == rhs.retry &&
+                   lhs.expire == rhs.expire &&
+                   lhs.minimum == rhs.minimum;
+        }
+
+        inline bool operator==(const srv_record_data& lhs, const srv_record_data& rhs) {
+            return lhs.priority == rhs.priority &&
+                   lhs.weight == rhs.weight &&
+                   lhs.port == rhs.port &&
+                   lhs.target == rhs.target;
+        }
+
+        inline bool operator==(const ptr_record_data& lhs, const ptr_record_data& rhs) {
+            return lhs.ptrname == rhs.ptrname;
+        }
+
+        inline bool operator==(const caa_record_data& lhs, const caa_record_data& rhs) {
+            return lhs.flags == rhs.flags &&
+                   lhs.tag == rhs.tag &&
+                   lhs.value == rhs.value;
+        }
+
+        inline bool operator==(const generic_record_data& lhs, const generic_record_data& rhs) {
+            return lhs.type == rhs.type && lhs.raw == rhs.raw;
+        }
+
         struct dns_record {
-            std::string name;
+            std::string name{};
             dns_record_type type{};
-            uint16_t record_class = 1;
+            uint16_t record_class{1};
             uint32_t ttl{};
-            dns_record_data data;
+            dns_record_data data{};
+            int64_t created_at{std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()};
+
+            void serialize(std::ostream& os) const {
+                utility::write_string(os, name);
+                utility::write<uint16_t>(os, static_cast<uint16_t>(type));
+                utility::write<uint16_t>(os, record_class);
+                utility::write<uint32_t>(os, ttl);
+                utility::write<int64_t>(os, created_at);
+
+                std::visit([&]<typename T0>(T0&& val) {
+                    using T = std::decay_t<T0>;
+                    if constexpr (std::is_same_v<T, a_record_data>) {
+                        utility::write<uint8_t>(os, 1);
+                        utility::write_string(os, val.ip.get_ip());
+                    } else if constexpr (std::is_same_v<T, aaaa_record_data>) {
+                        utility::write<uint8_t>(os, 2);
+                        utility::write_string(os, val.ip.get_ip());
+                    } else if constexpr (std::is_same_v<T, cname_record_data>) {
+                        utility::write<uint8_t>(os, 3);
+                        utility::write_string(os, val.cname);
+                    } else if constexpr (std::is_same_v<T, mx_record_data>) {
+                        utility::write<uint8_t>(os, 4);
+                        utility::write<uint16_t>(os, val.preference);
+                        utility::write_string(os, val.exchange);
+                    } else if constexpr (std::is_same_v<T, ns_record_data>) {
+                        utility::write<uint8_t>(os, 5);
+                        utility::write_string(os, val.ns);
+                    } else if constexpr (std::is_same_v<T, txt_record_data>) {
+                        utility::write<uint8_t>(os, 6);
+                        uint32_t count = val.text.size();
+                        utility::write(os, count);
+                        for (const auto& s : val.text) {
+                            utility::write_string(os, s);
+                        }
+                    } else if constexpr (std::is_same_v<T, soa_record_data>) {
+                        utility::write<uint8_t>(os, 7);
+                        utility::write_string(os, val.mname);
+                        utility::write_string(os, val.rname);
+                        utility::write(os, val.serial);
+                        utility::write(os, val.refresh);
+                        utility::write(os, val.retry);
+                        utility::write(os, val.expire);
+                        utility::write(os, val.minimum);
+                    } else if constexpr (std::is_same_v<T, srv_record_data>) {
+                        utility::write<uint8_t>(os, 8);
+                        utility::write(os, val.priority);
+                        utility::write(os, val.weight);
+                        utility::write(os, val.port);
+                        utility::write_string(os, val.target);
+                    } else if constexpr (std::is_same_v<T, ptr_record_data>) {
+                        utility::write<uint8_t>(os, 9);
+                        utility::write_string(os, val.ptrname);
+                    } else if constexpr (std::is_same_v<T, caa_record_data>) {
+                        utility::write<uint8_t>(os, 10);
+                        utility::write(os, val.flags);
+                        utility::write_string(os, val.tag);
+                        utility::write_string(os, val.value);
+                    } else if constexpr (std::is_same_v<T, generic_record_data>) {
+                        utility::write<uint8_t>(os, 11);
+                        utility::write(os, val.type);
+                        utility::write<uint32_t>(os, val.raw.size());
+                        os.write(reinterpret_cast<const char*>(val.raw.data()), val.raw.size());
+                    } else if constexpr (std::is_same_v<T, std::monostate>) {
+                        utility::write<uint8_t>(os, 0);
+                    }
+                }, data);
+            }
+
+            static dns_record deserialize(std::istream& is) {
+                dns_record rec;
+                rec.name = utility::read_string(is);
+
+                uint16_t type_raw;
+                utility::read(is, type_raw);
+                rec.type = static_cast<dns_record_type>(type_raw);
+
+                utility::read(is, rec.record_class);
+                utility::read(is, rec.ttl);
+                utility::read<int64_t>(is, rec.created_at);
+
+                uint8_t tag;
+                utility::read(is, tag);
+
+                switch (tag) {
+                case 1: {
+                        a_record_data a;
+                        a.ip = sock_ip_list::from_ipv4(utility::read_string(is));
+                        rec.data = a;
+                        break;
+                }
+                case 2: {
+                        aaaa_record_data aaaa;
+                        aaaa.ip = sock_ip_list::from_ipv6(utility::read_string(is));
+                        rec.data = aaaa;
+                        break;
+                }
+                case 3: {
+                        cname_record_data c;
+                        c.cname = utility::read_string(is);
+                        rec.data = c;
+                        break;
+                }
+                case 4: {
+                        mx_record_data m;
+                        utility::read(is, m.preference);
+                        m.exchange = utility::read_string(is);
+                        rec.data = m;
+                        break;
+                }
+                case 5: {
+                        ns_record_data n;
+                        n.ns = utility::read_string(is);
+                        rec.data = n;
+                        break;
+                }
+                case 6: {
+                        txt_record_data t;
+                        uint32_t count;
+                        utility::read(is, count);
+                        t.text.resize(count);
+                        for (auto& s : t.text) {
+                            s = utility::read_string(is);
+                        }
+                        rec.data = t;
+                        break;
+                }
+                case 7: {
+                        soa_record_data soa;
+                        soa.mname = utility::read_string(is);
+                        soa.rname = utility::read_string(is);
+                        utility::read(is, soa.serial);
+                        utility::read(is, soa.refresh);
+                        utility::read(is, soa.retry);
+                        utility::read(is, soa.expire);
+                        utility::read(is, soa.minimum);
+                        rec.data = soa;
+                        break;
+                }
+                case 8: {
+                        srv_record_data srv;
+                        utility::read(is, srv.priority);
+                        utility::read(is, srv.weight);
+                        utility::read(is, srv.port);
+                        srv.target = utility::read_string(is);
+                        rec.data = srv;
+                        break;
+                }
+                case 9: {
+                        ptr_record_data p;
+                        p.ptrname = utility::read_string(is);
+                        rec.data = p;
+                        break;
+                }
+                case 10: {
+                        caa_record_data c;
+                        utility::read(is, c.flags);
+                        c.tag = utility::read_string(is);
+                        c.value = utility::read_string(is);
+                        rec.data = c;
+                        break;
+                }
+                case 11: {
+                        generic_record_data g;
+                        utility::read(is, g.type);
+                        uint32_t len;
+                        utility::read(is, len);
+                        g.raw.resize(len);
+                        is.read(reinterpret_cast<char*>(g.raw.data()), len);
+                        rec.data = g;
+                        break;
+                }
+                case 0:
+                default:
+                    rec.data = std::monostate{};
+                }
+
+                return rec;
+            }
         };
 
-        using dns_selector = std::variant<std::monostate, std::string, dns_record_type>;
-        class dns_resolver final {
-            std::string hostname{};
+        inline bool operator==(const dns_record& lhs, const dns_record& rhs) {
+            return lhs.name == rhs.name &&
+                   lhs.type == rhs.type &&
+                   lhs.record_class == rhs.record_class &&
+                   lhs.data == rhs.data;
+        }
 
-            void throw_if_invalid() const {
-                if (hostname == "localhost") {
-                    return;
+        namespace deprecated {
+            using dns_selector = std::variant<std::monostate, std::string, dns_record_type>;
+            class dns_resolver final {
+                std::string hostname{};
+
+                void throw_if_invalid() const {
+                    if (hostname == "localhost") {
+                        return;
+                    }
+                    if (hostname.empty()) {
+                        throw parsing_error("dns_resolver(): hostname cannot be empty");
+                    }
+                    if (hostname.find('.') == std::string::npos) {
+                        throw parsing_error("dns_resolver(): hostname must contain at least one dot (.)");
+                    }
+                    if (hostname.back() == '.') {
+                        throw parsing_error("dns_resolver(): hostname cannot end with a dot (.)");
+                    }
                 }
-                if (hostname.empty()) {
-                    throw parsing_error("dns_resolver(): hostname cannot be empty");
+
+                template<typename>
+                struct always_false : std::false_type {};
+
+                static int dns_type_from_string(const std::string& type_str) {
+                    static const std::unordered_map<std::string, int> type_map = {
+                        {"A", ns_t_a},
+                        {"AAAA", ns_t_aaaa},
+                        {"CNAME", ns_t_cname},
+                        {"MX", ns_t_mx},
+                        {"NS", ns_t_ns},
+                        {"TXT", ns_t_txt},
+                        {"SOA", ns_t_soa},
+                        {"SRV", ns_t_srv},
+                        {"PTR", ns_t_ptr},
+                        {"CAA", 257},
+                        {"ANY", ns_t_any}
+                    };
+
+                    std::string key = type_str;
+                    std::ranges::transform(key.begin(), key.end(), key.begin(), ::toupper); // normalize
+
+                    auto it = type_map.find(key);
+                    if (it != type_map.end()) return it->second;
+
+                    throw dns_error("dns_type_from_string(): unknown DNS type: " + type_str);
                 }
-                if (hostname.find('.') == std::string::npos) {
-                    throw parsing_error("dns_resolver(): hostname must contain at least one dot (.)");
-                }
-                if (hostname.back() == '.') {
-                    throw parsing_error("dns_resolver(): hostname cannot end with a dot (.)");
-                }
-            }
 
-            template<typename>
-            struct always_false : std::false_type {};
-
-            static int dns_type_from_string(const std::string& type_str) {
-                static const std::unordered_map<std::string, int> type_map = {
-                    {"A", ns_t_a},
-                    {"AAAA", ns_t_aaaa},
-                    {"CNAME", ns_t_cname},
-                    {"MX", ns_t_mx},
-                    {"NS", ns_t_ns},
-                    {"TXT", ns_t_txt},
-                    {"SOA", ns_t_soa},
-                    {"SRV", ns_t_srv},
-                    {"PTR", ns_t_ptr},
-                    {"CAA", 257},
-                    {"ANY", ns_t_any}
-                };
-
-                std::string key = type_str;
-                std::ranges::transform(key.begin(), key.end(), key.begin(), ::toupper); // normalize
-
-                auto it = type_map.find(key);
-                if (it != type_map.end()) return it->second;
-
-                throw dns_error("dns_type_from_string(): unknown DNS type: " + type_str);
-            }
-
-            static int resolve_query_type(const dns_selector& selector) {
-                return std::visit([]<typename T0>(T0&& arg) -> int {
-                    using T = std::decay_t<T0>;
-                    if constexpr (std::is_same_v<T, std::monostate>) return ns_t_any;
-                    else if constexpr (std::is_same_v<T, std::string>) return dns_type_from_string(arg);
-                    else if constexpr (std::is_same_v<T, dns_record_type>) {
-                        switch (arg) {
-                            case dns_record_type::A: return ns_t_a;
-                            case dns_record_type::AAAA: return ns_t_aaaa;
-                            case dns_record_type::CNAME: return ns_t_cname;
-                            case dns_record_type::MX: return ns_t_mx;
-                            case dns_record_type::NS: return ns_t_ns;
-                            case dns_record_type::TXT: return ns_t_txt;
-                            case dns_record_type::SOA: return ns_t_soa;
-                            case dns_record_type::SRV: return ns_t_srv;
-                            case dns_record_type::PTR: return ns_t_ptr;
-                            case dns_record_type::CAA: return 257;
-                            default: return ns_t_any;
+                static int resolve_query_type(const dns_selector& selector) {
+                    return std::visit([]<typename T0>(T0&& arg) -> int {
+                        using T = std::decay_t<T0>;
+                        if constexpr (std::is_same_v<T, std::monostate>) return ns_t_any;
+                        else if constexpr (std::is_same_v<T, std::string>) return dns_type_from_string(arg);
+                        else if constexpr (std::is_same_v<T, dns_record_type>) {
+                            switch (arg) {
+                                case dns_record_type::A: return ns_t_a;
+                                case dns_record_type::AAAA: return ns_t_aaaa;
+                                case dns_record_type::CNAME: return ns_t_cname;
+                                case dns_record_type::MX: return ns_t_mx;
+                                case dns_record_type::NS: return ns_t_ns;
+                                case dns_record_type::TXT: return ns_t_txt;
+                                case dns_record_type::SOA: return ns_t_soa;
+                                case dns_record_type::SRV: return ns_t_srv;
+                                case dns_record_type::PTR: return ns_t_ptr;
+                                case dns_record_type::CAA: return 257;
+                                default: return ns_t_any;
+                            }
+                        } else {
+                            static_assert(always_false<T>::value, "unhandled selector type");
                         }
-                    } else {
-                        static_assert(always_false<T>::value, "unhandled selector type");
-                    }
-                    throw dns_error("resolve_query_type(): unhandled selector type");
-                }, selector);
-            }
-        public:
-            dns_resolver() = default;
-            explicit dns_resolver(std::string hostname) : hostname(std::move(hostname)) {
-                throw_if_invalid();
-            }
-            /**
-             * @brief Set the hostname to resolve.
-             * @param hostname The hostname to resolve.
-             */
-            void set_hostname(const std::string& hostname) {
-                this->hostname = hostname;
-                throw_if_invalid();
-            }
-            /**
-             * @brief Get the hostname to resolve.
-             * @return The hostname to resolve.
-             */
-            [[nodiscard]] std::string get_hostname() const {
-                return this->hostname;
-            }
-            /**
-             * @brief Resolve the hostname to an IP address.
-             * @param port The port to use (default is 80).
-             * @return A sock_ip_list struct that contains the IPv4 and IPv6 addresses of the hostname.
-             */
-            [[nodiscard]] sock_ip_list resolve_hostname(const int port = 80) const {
-                addrinfo hints{}, *res;
-
-                hints.ai_family = AF_UNSPEC;
-                hints.ai_socktype = SOCK_STREAM;
-
-                int status = getaddrinfo(this->hostname.c_str(), std::to_string(port).c_str(), &hints, &res);
-                if (status != 0) {
-                    throw dns_error("resolve_hostname(): getaddrinfo failed: " + std::string(gai_strerror(status)));
+                        throw dns_error("resolve_query_type(): unhandled selector type");
+                    }, selector);
                 }
-
-                std::string v4{};
-                std::string v6{};
-
-                for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
-                    char ipstr[INET6_ADDRSTRLEN];
-
-                    void* addr{};
-                    if (p->ai_family == AF_INET) {
-                        auto* ipv4 = reinterpret_cast<sockaddr_in*>(p->ai_addr);
-                        addr = &(ipv4->sin_addr);
-                    } else if (p->ai_family == AF_INET6) {
-                        auto* ipv6 = reinterpret_cast<sockaddr_in6*>(p->ai_addr);
-                        addr = &(ipv6->sin6_addr);
-                    } else {
-                        freeaddrinfo(res);
-                        throw dns_error("resolve_hostname(): unknown address family");
-                    }
-
-                    inet_ntop(p->ai_family, addr, ipstr, sizeof(ipstr));
-                    if (p->ai_family == AF_INET) {
-                        v4 = ipstr;
-                    } else if (p->ai_family == AF_INET6) {
-                        v6 = ipstr;
-                    }
+            public:
+                dns_resolver() = default;
+                explicit dns_resolver(std::string hostname) : hostname(std::move(hostname)) {
+                    throw_if_invalid();
                 }
+                /**
+                 * @brief Set the hostname to resolve.
+                 * @param hostname The hostname to resolve.
+                 */
+                void set_hostname(const std::string& hostname) {
+                    this->hostname = hostname;
+                    throw_if_invalid();
+                }
+                /**
+                 * @brief Get the hostname to resolve.
+                 * @return The hostname to resolve.
+                 */
+                [[nodiscard]] std::string get_hostname() const {
+                    return this->hostname;
+                }
+                /**
+                 * @brief Resolve the hostname to an IP address.
+                 * @param port The port to use (default is 80).
+                 * @return A sock_ip_list struct that contains the IPv4 and IPv6 addresses of the hostname.
+                 */
+                [[nodiscard]] sock_ip_list resolve_hostname(const int port = 80) const {
+                    addrinfo hints{}, *res;
 
-                freeaddrinfo(res);
+                    hints.ai_family = AF_UNSPEC;
+                    hints.ai_socktype = SOCK_STREAM;
 
-                return {std::move(v4), std::move(v6)};
-            }
+                    int status = getaddrinfo(this->hostname.c_str(), std::to_string(port).c_str(), &hints, &res);
+                    if (status != 0) {
+                        throw dns_error("resolve_hostname(): getaddrinfo failed: " + std::string(gai_strerror(status)));
+                    }
+
+                    std::string v4{};
+                    std::string v6{};
+
+                    for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+                        char ipstr[INET6_ADDRSTRLEN];
+
+                        void* addr{};
+                        if (p->ai_family == AF_INET) {
+                            auto* ipv4 = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+                            addr = &(ipv4->sin_addr);
+                        } else if (p->ai_family == AF_INET6) {
+                            auto* ipv6 = reinterpret_cast<sockaddr_in6*>(p->ai_addr);
+                            addr = &(ipv6->sin6_addr);
+                        } else {
+                            freeaddrinfo(res);
+                            throw dns_error("resolve_hostname(): unknown address family");
+                        }
+
+                        inet_ntop(p->ai_family, addr, ipstr, sizeof(ipstr));
+                        if (p->ai_family == AF_INET) {
+                            v4 = ipstr;
+                        } else if (p->ai_family == AF_INET6) {
+                            v6 = ipstr;
+                        }
+                    }
+
+                    freeaddrinfo(res);
+
+                    return {std::move(v4), std::move(v6)};
+                }
 #ifdef SSOCK_UNIX
-            [[nodiscard]] std::vector<dns_record> query_records(const dns_selector& selector = std::monostate{}) const {
-                throw_if_invalid();
+                [[nodiscard]] std::vector<dns_record> query_records(const dns_selector& selector = std::monostate{}) const {
+                    throw_if_invalid();
 
-                int qtype = resolve_query_type(selector);
+                    int qtype = resolve_query_type(selector);
 
-                res_init();
+                    res_init();
 
-                u_char response[2048]{};
-                int len = res_query(hostname.c_str(), ns_c_in, qtype, response, sizeof(response));
-                if (len < 0) {
-                    if (h_errno == NO_DATA) {
-                        return {};
+                    u_char response[2048]{};
+                    int len = res_query(hostname.c_str(), ns_c_in, qtype, response, sizeof(response));
+                    if (len < 0) {
+                        if (h_errno == NO_DATA) {
+                            return {};
+                        }
+                        throw dns_error("query_records(): res_query failed: " + std::string(hstrerror(h_errno)));
                     }
-                    throw dns_error("query_records(): res_query failed: " + std::string(hstrerror(h_errno)));
-                }
 
-                ns_msg handle;
-                if (len != 0) {
-                    if (ns_initparse(response, len, &handle) < 0) {
-                        std::string error = "query_records(): DNS response parse failed with error: " + std::string(hstrerror(h_errno));
-                        error += ", length: " + std::to_string(len);
-                        throw parsing_error("query_records(): DNS response parse failed: " + error);
+                    ns_msg handle;
+                    if (len != 0) {
+                        if (ns_initparse(response, len, &handle) < 0) {
+                            std::string error = "query_records(): DNS response parse failed with error: " + std::string(hstrerror(h_errno));
+                            error += ", length: " + std::to_string(len);
+                            throw parsing_error("query_records(): DNS response parse failed: " + error);
+                        }
                     }
-                }
 
-                std::vector<dns_record> records;
-                int count = ns_msg_count(handle, ns_s_an);
+                    std::vector<dns_record> records;
+                    int count = ns_msg_count(handle, ns_s_an);
 
-                for (int i = 0; i < count; ++i) {
-                    ns_rr rr;
-                    if (ns_parserr(&handle, ns_s_an, i, &rr) != 0) continue;
+                    for (int i = 0; i < count; ++i) {
+                        ns_rr rr;
+                        if (ns_parserr(&handle, ns_s_an, i, &rr) != 0) continue;
 
-                    const u_char* rdata = ns_rr_rdata(rr);
-                    uint16_t type = ns_rr_type(rr);
-                    uint16_t rdlen = ns_rr_rdlen(rr);
+                        const u_char* rdata = ns_rr_rdata(rr);
+                        uint16_t type = ns_rr_type(rr);
+                        uint16_t rdlen = ns_rr_rdlen(rr);
 
-                    dns_record rec;
-                    rec.name = ns_rr_name(rr);
-                    rec.ttl = ns_rr_ttl(rr);
-                    rec.type = dns_record_type::OTHER;
+                        dns_record rec;
+                        rec.name = ns_rr_name(rr);
+                        rec.ttl = ns_rr_ttl(rr);
+                        rec.type = dns_record_type::OTHER;
 
-                    switch (type) {
+                        switch (type) {
                         case ns_t_a: {
-                            char ip[INET_ADDRSTRLEN];
-                            inet_ntop(AF_INET, rdata, ip, sizeof(ip));
-                            rec.type = dns_record_type::A;
-                            auto list = sock_ip_list{ip, ""};
-                            rec.data = a_record_data{list};
-                            break;
+                                char ip[INET_ADDRSTRLEN];
+                                inet_ntop(AF_INET, rdata, ip, sizeof(ip));
+                                rec.type = dns_record_type::A;
+                                auto list = sock_ip_list{ip, ""};
+                                rec.data = a_record_data{list};
+                                break;
                         }
                         case ns_t_aaaa: {
-                            char ip[INET6_ADDRSTRLEN];
-                            inet_ntop(AF_INET6, rdata, ip, sizeof(ip));
-                            rec.type = dns_record_type::AAAA;
-                            auto list = sock_ip_list{"", ip};
-                            rec.data = aaaa_record_data{list};
-                            break;
+                                char ip[INET6_ADDRSTRLEN];
+                                inet_ntop(AF_INET6, rdata, ip, sizeof(ip));
+                                rec.type = dns_record_type::AAAA;
+                                auto list = sock_ip_list{"", ip};
+                                rec.data = aaaa_record_data{list};
+                                break;
                         }
                         case ns_t_cname: {
-                            char cname[NS_MAXDNAME];
-                            ns_name_uncompress(response, response + len, rdata, cname, sizeof(cname));
-                            rec.type = dns_record_type::CNAME;
-                            rec.data = cname_record_data{cname};
-                            break;
+                                char cname[NS_MAXDNAME];
+                                ns_name_uncompress(response, response + len, rdata, cname, sizeof(cname));
+                                rec.type = dns_record_type::CNAME;
+                                rec.data = cname_record_data{cname};
+                                break;
                         }
                         case ns_t_txt: {
-                            txt_record_data txt;
-                            int offset = 0;
-                            while (offset < rdlen) {
-                                uint8_t slen = rdata[offset];
-                                txt.text.emplace_back(reinterpret_cast<const char*>(&rdata[offset + 1]), slen);
-                                offset += slen + 1;
-                            }
-                            rec.type = dns_record_type::TXT;
-                            rec.data = txt;
-                            break;
+                                txt_record_data txt;
+                                int offset = 0;
+                                while (offset < rdlen) {
+                                    uint8_t slen = rdata[offset];
+                                    txt.text.emplace_back(reinterpret_cast<const char*>(&rdata[offset + 1]), slen);
+                                    offset += slen + 1;
+                                }
+                                rec.type = dns_record_type::TXT;
+                                rec.data = txt;
+                                break;
                         }
                         default: {
-                            std::vector<uint8_t> raw(rdata, rdata + rdlen);
-                            rec.data = generic_record_data{type, raw};
-                            break;
+                                std::vector<uint8_t> raw(rdata, rdata + rdlen);
+                                rec.data = generic_record_data{type, raw};
+                                break;
                         }
+                        }
+
+                        records.push_back(std::move(rec));
                     }
 
-                    records.push_back(std::move(rec));
+                    return records;
                 }
-
-                return records;
-            }
 #endif
 #ifdef SSOCK_WINDOWS
-            [[nodiscard]] std::vector<dns_record> query_records(const dns_selector& selector = std::monostate{}) const {
-                throw_if_invalid();
+                [[nodiscard]] std::vector<dns_record> query_records(const dns_selector& selector = std::monostate{}) const {
+                    throw_if_invalid();
 
-                WORD qtype = resolve_query_type(selector);
+                    WORD qtype = resolve_query_type(selector);
 
-                PDNS_RECORD pRecord = nullptr;
-                DNS_STATUS status = DnsQuery_A(
-                    hostname.c_str(),
-                    qtype,
-                    DNS_QUERY_STANDARD,
-                    nullptr,
-                    &pRecord,
-                    nullptr
-                );
+                    PDNS_RECORD pRecord = nullptr;
+                    DNS_STATUS status = DnsQuery_A(
+                        hostname.c_str(),
+                        qtype,
+                        DNS_QUERY_STANDARD,
+                        nullptr,
+                        &pRecord,
+                        nullptr
+                    );
 
-                if (status == DNS_INFO_NO_RECORDS || status == DNS_ERROR_RCODE_NAME_ERROR) {
-                    return {};
-                }
-
-                if (status != 0 || pRecord == nullptr) {
-                    throw dns_error("query_records(): DnsQuery_A failed with error code: " + std::to_string(status));
-                }
-
-                std::vector<dns_record> records;
-
-                for (PDNS_RECORD rec = pRecord; rec != nullptr; rec = rec->pNext) {
-                    dns_record result;
-                    result.name = rec->pName;
-                    result.ttl = rec->dwTtl;
-                    result.type = dns_record_type::OTHER;
-
-                    switch (rec->wType) {
-                        case DNS_TYPE_A: {
-                            char ip[INET_ADDRSTRLEN];
-                            inet_ntop(AF_INET, &rec->Data.A.IpAddress, ip, sizeof(ip));
-                            result.type = dns_record_type::A;
-                            result.data = a_record_data{sock_ip_list{ip, ""}};
-                            break;
-                        }
-                        case DNS_TYPE_AAAA: {
-                            char ip[INET6_ADDRSTRLEN];
-                            inet_ntop(AF_INET6, rec->Data.AAAA.Ip6Address.IP6Byte, ip, sizeof(ip));
-                            result.type = dns_record_type::AAAA;
-                            result.data = aaaa_record_data{sock_ip_list{"", ip}};
-                            break;
-                        }
-                        case DNS_TYPE_CNAME: {
-                            result.type = dns_record_type::CNAME;
-                            result.data = cname_record_data{rec->Data.CNAME.pNameHost};
-                            break;
-                        }
-                        case DNS_TYPE_TEXT: {
-                            txt_record_data txt;
-                            for (DWORD i = 0; i < rec->Data.TXT.dwStringCount; ++i) {
-                                txt.text.emplace_back(rec->Data.TXT.pStringArray[i]);
-                            }
-                            result.type = dns_record_type::TXT;
-                            result.data = txt;
-                            break;
-                        }
-                        default: {
-                            result.data = generic_record_data{rec->wType, {}};
-                            break;
-                        }
+                    if (status == DNS_INFO_NO_RECORDS || status == DNS_ERROR_RCODE_NAME_ERROR) {
+                        return {};
                     }
 
-                    records.push_back(std::move(result));
+                    if (status != 0 || pRecord == nullptr) {
+                        throw dns_error("query_records(): DnsQuery_A failed with error code: " + std::to_string(status));
+                    }
+
+                    std::vector<dns_record> records;
+
+                    for (PDNS_RECORD rec = pRecord; rec != nullptr; rec = rec->pNext) {
+                        dns_record result;
+                        result.name = rec->pName;
+                        result.ttl = rec->dwTtl;
+                        result.type = dns_record_type::OTHER;
+
+                        switch (rec->wType) {
+                        case DNS_TYPE_A: {
+                                char ip[INET_ADDRSTRLEN];
+                                inet_ntop(AF_INET, &rec->Data.A.IpAddress, ip, sizeof(ip));
+                                result.type = dns_record_type::A;
+                                result.data = a_record_data{sock_ip_list{ip, ""}};
+                                break;
+                        }
+                        case DNS_TYPE_AAAA: {
+                                char ip[INET6_ADDRSTRLEN];
+                                inet_ntop(AF_INET6, rec->Data.AAAA.Ip6Address.IP6Byte, ip, sizeof(ip));
+                                result.type = dns_record_type::AAAA;
+                                result.data = aaaa_record_data{sock_ip_list{"", ip}};
+                                break;
+                        }
+                        case DNS_TYPE_CNAME: {
+                                result.type = dns_record_type::CNAME;
+                                result.data = cname_record_data{rec->Data.CNAME.pNameHost};
+                                break;
+                        }
+                        case DNS_TYPE_TEXT: {
+                                txt_record_data txt;
+                                for (DWORD i = 0; i < rec->Data.TXT.dwStringCount; ++i) {
+                                    txt.text.emplace_back(rec->Data.TXT.pStringArray[i]);
+                                }
+                                result.type = dns_record_type::TXT;
+                                result.data = txt;
+                                break;
+                        }
+                        default: {
+                                result.data = generic_record_data{rec->wType, {}};
+                                break;
+                        }
+                        }
+
+                        records.push_back(std::move(result));
+                    }
+
+                    DnsRecordListFree(pRecord, DnsFreeRecordList);
+
+                    return records;
                 }
-
-                DnsRecordListFree(pRecord, DnsFreeRecordList);
-
-                return records;
-            }
 #endif
-        };
+            };
+        }
     }
 
-    /**
-     * @brief A function that gets the local network interfaces.
-     * @return A vector of network_interface structs that contain the local network interfaces.
-     */
-    inline std::vector<network_interface> get_interfaces();
-    /**
-     * @brief A function that checks if a usable IPv6 address exists.
-     * @return True if a usable IPv6 address exists, false otherwise.
-     * @note This function checks the local network interfaces for a usable IPv6 address.
-     */
-    static bool usable_ipv6_address_exists();
-    /**
-     * @brief A function that checks if a string is a valid IPv4 address.
-     * @param ip The string to check.
-     * @return True if the string is a valid IPv4 address, false otherwise.
-     */
-    static bool is_ipv4(const std::string& ip);
-    /**
-     * @brief A function that checks if a string is a valid IPv6 address.
-     * @param ip The string to check.
-     * @return True if the string is a valid IPv6 address, false otherwise.
-     */
-    static bool is_ipv6(const std::string& ip);
-    /**
-     * @brief A function that checks if a port is valid.
-     * @param port The port to check.
-     * @return True if the port is valid, false otherwise.
-     */
-    static bool is_valid_port(int port);
     /**
      * @brief Get a list of all network interfaces on the system.
      * @return A vector of network_interface objects.
@@ -1271,6 +1628,11 @@ namespace ssock::network {
     }
 }
 
+
+namespace ssock::internal_net {
+    ssock::network::sock_ip_list get_a_aaaa_from_hostname(const std::string& hostname);
+}
+
 /**
  * @brief Namespace for the ssock library.
  */
@@ -1295,6 +1657,7 @@ namespace ssock::sock {
     enum class sock_type {
         tcp, /* TCP socket */
         udp, /* UDP socket */
+        unix, /* UNIX domain socket */
     };
     /**
      * @brief Socket options.
@@ -1308,6 +1671,26 @@ namespace ssock::sock {
         no_keep_alive = 1 << 4, /* Disable keep-alive option */
         no_blocking = 1 << 5, /* Set socket to non-blocking mode. Not necessarily supported. */
         blocking = 1 << 6, /* Set socket to blocking mode */
+    };
+
+    /**
+     * @brief Socket receive status.
+     * @note This enum is used to indicate the status of a socket receive operation.
+     */
+    enum class sock_recv_status {
+        success,
+        timeout,
+        closed,
+        error
+    };
+
+    /**
+     * @brief Result of a socket receive operation.
+     * @note This struct contains the result data and the status of the receive operation.
+     */
+    struct sock_recv_result {
+        std::string data{};
+        sock_recv_status status{sock_recv_status::success};
     };
 
     inline sock_opt operator|(sock_opt lhs, sock_opt rhs) {
@@ -1335,6 +1718,7 @@ namespace ssock::sock {
      * @param t The address type (ipv4, ipv6, hostname_ipv4, hostname_ipv6).
      */
     class sock_addr final {
+        std::filesystem::path path{};
         std::string hostname{};
         std::string ip{};
         int port{};
@@ -1350,10 +1734,9 @@ namespace ssock::sock {
          * @param t The address type (ipv4, ipv6, hostname_ipv4, hostname_ipv6).
          */
         sock_addr(const std::string& hostname, int port, sock_addr_type t) : hostname(hostname), port(port), type(t) {
-            const auto resolve_host = [](const std::string& h, int p, bool t) -> std::string {
+            const auto resolve_host = [](const std::string& h, bool t) -> std::string {
                 try {
-                    network::dns::dns_resolver resolver(h);
-                    auto ip_list = resolver.resolve_hostname(p);
+                    auto ip_list = internal_net::get_a_aaaa_from_hostname(h);
                     auto ip = t ? ip_list.get_ipv6() : ip_list.get_ipv4();
                     return ip;
                 } catch (const std::exception&) {
@@ -1362,7 +1745,7 @@ namespace ssock::sock {
             };
 
             if (type == sock_addr_type::hostname) {
-                ip = resolve_host(hostname, port, true);
+                ip = resolve_host(hostname, true);
                 type = ssock::sock::sock_addr_type::ipv6;
 
                 if (!ssock::network::usable_ipv6_address_exists()) {
@@ -1370,14 +1753,14 @@ namespace ssock::sock {
                 }
 
                 if (ip.empty()) {
-                    ip = resolve_host(hostname, port, false);
+                    ip = resolve_host(hostname, false);
                     type = ssock::sock::sock_addr_type::ipv4;
                 }
             } else if (type == sock_addr_type::hostname_ipv4) {
-                ip = resolve_host(hostname, port, false);
+                ip = resolve_host(hostname, false);
                 type = ssock::sock::sock_addr_type::ipv4;
             } else if (type == sock_addr_type::hostname_ipv6) {
-                ip = resolve_host(hostname, port, true);
+                ip = resolve_host(hostname, true);
                 type = ssock::sock::sock_addr_type::ipv6;
             } else if (type == sock_addr_type::ipv4 || type == sock_addr_type::ipv6) {
                 ip = hostname;
@@ -1397,7 +1780,16 @@ namespace ssock::sock {
                 this->hostname.clear();
             }
         }
-
+        /**
+         * @brief Constructs a sock_addr object for a file path.
+         * @param path The file path to use.
+         * @throws parsing_error if the path does not exist.
+         */
+        explicit sock_addr(const std::filesystem::path& path) : path(path), type(sock_addr_type::filename) {
+            if (!std::filesystem::exists(path)) {
+                throw parsing_error("sock_addr(): path does not exist");
+            }
+        }
         /**
          * @brief Check whether the address is IPv4 or IPv6.
          * @return True if the address is IPv4, false if it is IPv6 or invalid.
@@ -1413,30 +1805,32 @@ namespace ssock::sock {
             return type == sock_addr_type::ipv6;
         }
         /**
-         * @brief Get the stored IP address.
-         * @return The stored IP address.
-         * @note Reference
+         * @brief Check whether the address is a file path.
+         * @return True if the address is a file path, false if it is an IP address, hostname or invalid.
          */
-        std::string& get_ip() {
-            return this->ip;
+        [[nodiscard]] bool is_file_path() const noexcept {
+            return type == sock_addr_type::filename;
         }
         /**
          * @brief Get the stored IP address.
          * @return The stored IP address.
          */
-        [[nodiscard]] std::string get_ip() const noexcept {
-            return this->ip;
-        }
-        /**
-         * @brief Get the stored hostname.
-         * @return The stored hostname.
-         * @note Reference
-         */
-        std::string& get_hostname() {
-            if (hostname.empty()) {
-                throw parsing_error("hostname is empty, use get_ip() instead");
+        [[nodiscard]] std::string get_ip() const {
+            if (type == sock_addr_type::filename) {
+                throw parsing_error("sock_addr(): cannot get IP from a file path");
             }
-            return hostname;
+
+            return this->ip;
+        }
+        /**
+         * @brief Get the stored file path.
+         * @return The stored file path.
+         */
+        [[nodiscard]] std::filesystem::path get_path() const {
+            if (type != sock_addr_type::filename) {
+                throw parsing_error("sock_addr(): cannot get path from an IP address or hostname");
+            }
+            return this->path;
         }
         /**
          * @brief Get the stored hostname.
@@ -1446,13 +1840,20 @@ namespace ssock::sock {
             if (hostname.empty()) {
                 throw parsing_error("hostname is empty, use get_ip() instead");
             }
+            if (type == sock_addr_type::filename) {
+                throw parsing_error("sock_addr(): cannot get hostname from a file path");
+            }
             return hostname;
         }
         /**
          * @brief Get the stored port.
          * @return The stored port.
          */
-        [[nodiscard]] int get_port() const noexcept {
+        [[nodiscard]] int get_port() const {
+            if (type == sock_addr_type::filename) {
+                throw parsing_error("sock_addr(): cannot get port from a file path");
+            }
+
             return port;
         }
         ~sock_addr() = default;
@@ -1477,10 +1878,10 @@ namespace ssock::sock {
         virtual std::unique_ptr<sync_sock> accept() = 0;
         virtual int send(const void* buf, size_t len) = 0;
         virtual void send(const std::string& buf) = 0;
-        [[nodiscard]] virtual std::string recv(int timeout_seconds) const = 0;
-        [[nodiscard]] virtual std::string recv(int timeout_seconds, const std::string& match) const = 0;
-        [[nodiscard]] virtual std::string recv(int timeout_seconds, const std::string& match, size_t eof) const = 0;
-        [[nodiscard]] virtual std::string recv(int timeout_seconds, size_t eof) const = 0;
+        [[nodiscard]] virtual sock_recv_result recv(int timeout_seconds) const = 0;
+        [[nodiscard]] virtual sock_recv_result recv(int timeout_seconds, const std::string& match) const = 0;
+        [[nodiscard]] virtual sock_recv_result recv(int timeout_seconds, const std::string& match, size_t eof) const = 0;
+        [[nodiscard]] virtual sock_recv_result recv(int timeout_seconds, size_t eof) const = 0;
         virtual void close() = 0;
     };
 
@@ -1501,6 +1902,10 @@ namespace ssock::sock {
         [[nodiscard]] socklen_t get_sa_len() const {
             if (addr.is_ipv4()) return sizeof(sockaddr_in);
             if (addr.is_ipv6()) return sizeof(sockaddr_in6);
+            if (addr.is_file_path()) {
+                const auto& path = addr.get_path();
+                return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.string().size() + 1);
+            }
 
             throw socket_error("invalid address type");
         }
@@ -1521,30 +1926,21 @@ namespace ssock::sock {
                 if (inet_pton(AF_INET6, addr.get_ip().c_str(), &sa6->sin6_addr) <= 0) {
                     throw parsing_error("invalid IPv6 address");
                 }
+            } else if (addr.is_file_path()) {
+                auto* sa_un = reinterpret_cast<sockaddr_un*>(&sa_storage);
+                sa_un->sun_family = AF_UNIX;
+                const auto& path = addr.get_path().string();
+                if (path.size() >= sizeof(sa_un->sun_path)) {
+                    throw socket_error("UNIX socket path too long");
+                }
+                std::memcpy(sa_un->sun_path, path.c_str(), path.size() + 1);
             } else {
                 throw ip_error("invalid address type");
             }
         }
-    public:
-        /**
-         * @brief Constructs a sync_sock object.
-         * @param addr The socket address to bind to.
-         * @param t The socket type (tcp or udp).
-         * @param opts The socket options (reuse_addr, no_reuse_addr).
-         */
+
 #ifdef SSOCK_UNIX
-        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
-            if (addr.get_ip().empty()) {
-                throw socket_error("IP address is empty");
-            }
-
-            this->sockfd = internal_net::sys_net_socket(addr.is_ipv6() ? AF_INET6 : AF_INET,
-                                                              t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
-
-            if (this->sockfd < 0) {
-                throw socket_error("failed to create socket");
-            }
-
+        void set_sock_opts(sock_opt opts) const {
             if (opts & sock_opt::reuse_addr) {
                 internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opts, sizeof(opts));
             } else if (opts & sock_opt::no_reuse_addr) {
@@ -1579,73 +1975,112 @@ namespace ssock::sock {
                     throw socket_error("failed to set socket to blocking mode");
                 }
             }
-
-            this->prep_sa();
         }
 #endif
 #ifdef SSOCK_WINDOWS
-        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
-            if (addr.get_ip().empty()) {
-                throw socket_error("IP address is empty");
-            }
-
-            this->sockfd = socket(
-                addr.is_ipv6() ? AF_INET6 : AF_INET,
-                t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM,
-                IPPROTO_IP
-            );
-
-            if (this->sockfd == INVALID_SOCKET) {
-                throw socket_error("Failed to create socket");
-            }
-
+        void set_sock_opts(sock_opt opts) {
             if (opts & sock_opt::reuse_addr) {
                 BOOL optval = TRUE;
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set SO_REUSEADDR");
+                    throw socket_error("failed to set SO_REUSEADDR");
                 }
             } else if (opts & sock_opt::no_reuse_addr) {
                 BOOL optval = FALSE;
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to clear SO_REUSEADDR");
+                    throw socket_error("failed to clear SO_REUSEADDR");
                 }
             }
             if (opts & sock_opt::no_delay) {
                 BOOL optval = TRUE;
                 if (setsockopt(this->sockfd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set TCP_NODELAY");
+                    throw socket_error("failed to set TCP_NODELAY");
                 }
             }
             if (opts & sock_opt::keep_alive) {
                 BOOL optval = TRUE;
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set SO_KEEPALIVE");
+                    throw socket_error("failed to set SO_KEEPALIVE");
                 }
             } else if (opts & sock_opt::no_keep_alive) {
                 BOOL optval = FALSE;
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to clear SO_KEEPALIVE");
+                    throw socket_error("failed to clear SO_KEEPALIVE");
                 }
             }
             if (opts & sock_opt::no_blocking) {
                 u_long mode = 1;
                 if (ioctlsocket(this->sockfd, FIONBIO, &mode) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set socket to non-blocking mode");
+                    throw socket_error("failed to set socket to non-blocking mode");
                 }
             } else if (opts & sock_opt::blocking) {
                 u_long mode = 0;
                 if (ioctlsocket(this->sockfd, FIONBIO, &mode) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
-                    throw socket_error("Failed to set socket to blocking mode");
+                    throw socket_error("failed to set socket to blocking mode");
                 }
             }
+        }
+#endif
+    public:
+        /**
+         * @brief Constructs a sync_sock object.
+         * @param addr The socket address to bind to.
+         * @param t The socket type (tcp, udp, unix).
+         * @param opts The socket options (reuse_addr, no_reuse_addr).
+         */
+#ifdef SSOCK_UNIX
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
+            if (addr.get_ip().empty() && !addr.is_file_path()) {
+                throw socket_error("IP address/file path is empty");
+            }
 
+            if (t != sock_type::unix) {
+                this->sockfd = internal_net::sys_net_socket(addr.is_ipv6() ? AF_INET6 : AF_INET,
+                                                                  t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
+            } else {
+                this->sockfd = internal_net::sys_net_socket(AF_UNIX, SOCK_STREAM, 0);
+            }
+
+            if (this->sockfd < 0) {
+                throw socket_error("failed to create socket");
+            }
+
+            this->set_sock_opts(opts);
+            this->prep_sa();
+        }
+#endif
+#ifdef SSOCK_WINDOWS
+        sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking)
+            : addr(addr), type(t) {
+
+            if (addr.get_ip().empty() && !addr.is_file_path()) {
+                throw socket_error("IP address or file path is empty");
+            }
+
+            int domain = AF_UNIX;
+            int sock_type = SOCK_STREAM;
+            int protocol = 0;
+
+            if (t != sock_type::unix) {
+                domain = addr.is_ipv6() ? AF_INET6 : AF_INET;
+                sock_type = (t == sock_type::tcp) ? SOCK_STREAM : SOCK_DGRAM;
+                protocol = (t == sock_type::tcp) ? IPPROTO_TCP : IPPROTO_UDP;
+            } else {
+                protocol = 0;
+            }
+
+            this->sockfd = socket(domain, sock_type, protocol);
+            if (this->sockfd == INVALID_SOCKET) {
+                throw socket_error("Failed to create socket");
+            }
+
+            this->set_sock_opts(opts);
             this->prep_sa();
         }
 #endif
@@ -1874,146 +2309,145 @@ namespace ssock::sock {
          * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely until match is found)
          * @param match The substring to look for in received data.
          * @param eof The number of bytes to read before considering the match complete.
-         * @return The received data as a string.
+         * @return The received data as a sock_recv_result object.
          */
 #ifdef SSOCK_UNIX
-        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
+        [[nodiscard]] sock_recv_result recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
             std::string data;
             auto start = std::chrono::steady_clock::now();
 
             while (true) {
+                auto elapsed = std::chrono::steady_clock::now() - start;
+                auto remaining = std::chrono::seconds(timeout_seconds) - elapsed;
+                if (remaining <= std::chrono::seconds(0)) {
+                    return {data, sock_recv_status::timeout};
+                }
+
+                timeval tv{};
+                tv.tv_sec = std::chrono::duration_cast<std::chrono::seconds>(remaining).count();
+                tv.tv_usec = 0;
+
                 fd_set readfds;
                 FD_ZERO(&readfds);
                 FD_SET(this->sockfd, &readfds);
 
-                timeval tv{};
-                timeval* tv_ptr = nullptr;
-
-                if (timeout_seconds >= 0) {
-                    auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
-                    auto remaining = timeout_seconds - elapsed;
-                    if (remaining <= 0) {
-                        break;
-                    }
-                    tv.tv_sec = static_cast<long>(remaining);
-                    tv.tv_usec = 0;
-                    tv_ptr = &tv;
-                }
-
-                int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr, tv_ptr);
-
+                int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr, &tv);
                 if (ret < 0) {
                     throw socket_error("select() failed");
                 }
                 if (ret == 0) {
-                    continue;
+                    return {data, sock_recv_status::timeout};
                 }
 
                 if (FD_ISSET(this->sockfd, &readfds)) {
-                    char buf[8196];
-                    std::size_t received = internal_net::sys_net_recv(this->sockfd, buf, sizeof(buf), 0);
-                    if (received == 0) {
-                        break;
-                    }
-                    data.append(buf, received);
-                    if (data.length() >= eof && eof != 0) {
-                        break;
+                    size_t bytes_to_read = 8192;
+                    if (eof != 0 && data.size() + bytes_to_read > eof) {
+                        bytes_to_read = eof - data.size();
                     }
 
+                    char buf[8192];
+                    ssize_t received = internal_net::sys_net_recv(this->sockfd, buf, bytes_to_read, 0);
+                    if (received < 0) {
+                        if (errno == EINTR) continue;
+                        throw socket_error("recv() failed");
+                    }
+                    if (received == 0) {
+                        return {data, sock_recv_status::closed};
+                    }
+
+                    data.append(buf, static_cast<std::size_t>(received));
+
+                    if (eof != 0 && data.length() >= eof) {
+                        return {data, sock_recv_status::success};
+                    }
                     if (!match.empty() && data.find(match) != std::string::npos) {
-                        break;
+                        return {data, sock_recv_status::success};
                     }
                 }
             }
-
-            return data;
         }
 #endif
 #ifdef SSOCK_WINDOWS
-        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
+        [[nodiscard]] sock_recv_result recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
             std::string data;
             auto start = std::chrono::steady_clock::now();
 
             while (true) {
+                auto elapsed = std::chrono::steady_clock::now() - start;
+                auto remaining = std::chrono::seconds(timeout_seconds) - elapsed;
+                if (remaining <= std::chrono::seconds(0)) {
+                    return {data, sock_recv_status::timeout};
+                }
+
+                timeval tv{};
+                tv.tv_sec = static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(remaining).count());
+                tv.tv_usec = 0;
+
                 fd_set readfds;
                 FD_ZERO(&readfds);
                 FD_SET(this->sockfd, &readfds);
 
-                timeval tv{};
-                timeval* tv_ptr = nullptr;
-
-                if (timeout_seconds >= 0) {
-                    auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
-                    auto remaining = timeout_seconds - elapsed;
-                    if (remaining <= 0) {
-                        break;
-                    }
-                    tv.tv_sec = static_cast<long>(remaining);
-                    tv.tv_usec = 0;
-                    tv_ptr = &tv;
-                }
-
-                int ret = ::select(0, &readfds, nullptr, nullptr, tv_ptr);
-
+                int ret = ::select(this->sockfd + 1, &readfds, nullptr, nullptr, &tv);
                 if (ret == SOCKET_ERROR) {
-                    int err = WSAGetLastError();
-                    throw socket_error("select() failed, error code: " + std::to_string(err));
+                    throw socket_error("select() failed");
                 }
                 if (ret == 0) {
-                    continue;
+                    return {data, sock_recv_status::timeout};
                 }
 
                 if (FD_ISSET(this->sockfd, &readfds)) {
-                    char buf[8196];
-                    int received = ::recv(this->sockfd, buf, sizeof(buf), 0);
-                    if (received == 0) {
-                        break;
+                    size_t bytes_to_read = 8192;
+                    if (eof != 0 && data.size() + bytes_to_read > eof) {
+                        bytes_to_read = eof - data.size();
                     }
+
+                    char buf[8192];
+                    int received = ::recv(this->sockfd, buf, static_cast<int>(bytes_to_read), 0);
                     if (received == SOCKET_ERROR) {
                         int err = WSAGetLastError();
-                        throw socket_error("recv() failed, error code: " + std::to_string(err));
+                        if (err == WSAEINTR) continue;
+                        throw socket_error("recv() failed");
+                    }
+                    if (received == 0) {
+                        return {data, sock_recv_status::closed};
                     }
 
-                    data.append(buf, received);
-                    if (data.length() >= eof && eof != 0) {
-                        break;
-                    }
+                    data.append(buf, static_cast<std::size_t>(received));
 
+                    if (eof != 0 && data.size() >= eof) {
+                        return {data, sock_recv_status::success};
+                    }
                     if (!match.empty() && data.find(match) != std::string::npos) {
-                        break;
+                        return {data, sock_recv_status::success};
                     }
                 }
             }
-
-            return data;
         }
 #endif
         /* @brief Receive data from the server.
          * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
-         * @return The received data as a string.
+         * @return The received data as a sock_recv_result
          */
-        [[nodiscard]] std::string recv(const int timeout_seconds) const override {
+        [[nodiscard]] sock_recv_result recv(const int timeout_seconds) const override {
             return recv(timeout_seconds, "", 0);
         }
         /**
          * @brief Receive data from the server until a specific match is found.
          * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
          * @param match The substring to look for in received data.
-         * @return The received data as a string.
+         * @return The received data as a sock_recv_result object.
          */
-        [[nodiscard]] std::string recv(const int timeout_seconds, const std::string& match) const override {
-            return recv(timeout_seconds, match, 0);
+        [[nodiscard]] sock_recv_result recv(const int timeout_seconds, const std::string& match) const override {
+            return this->recv(timeout_seconds, match, 0);
         }
         /**
          * @brief Receive data from the server until a specific match is found or a certain amount of data is received.
          * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
          * @param eof The number of bytes to read before considering the match complete.
-         * @return The received data as a string.
+         * @return The received data as a sock_recv_result object.
          */
-        [[nodiscard]] std::string recv(const int timeout_seconds, size_t eof) const override {
-            return recv(timeout_seconds, "", eof);
+        [[nodiscard]] sock_recv_result recv(const int timeout_seconds, size_t eof) const override {
+            return this->recv(timeout_seconds, "", eof);
         }
 
         /**
@@ -2159,10 +2593,742 @@ namespace ssock::sock {
     }
 }
 
-/**
- * @brief Namespace for the ssock HTTP library.
- * @note Very basic, could very well be expanded in the future.
- */
+namespace ssock::network::dns {
+    class dns_nameserver_list {
+        std::vector<std::string> ipv4{};
+        std::vector<std::string> ipv6{};
+
+        friend dns_nameserver_list get_nameservers();
+    public:
+        dns_nameserver_list() = default;
+        dns_nameserver_list(std::vector<std::string> ipv4, std::vector<std::string> ipv6)
+: ipv4(std::move(ipv4)), ipv6(std::move(ipv6)) {
+            if (this->ipv4.empty() && this->ipv6.empty()) {
+                throw parsing_error("dns_nameserver(): at least one IP address must be provided");
+            }
+        }
+        [[nodiscard]] std::vector<std::string> get_ipv4() const {
+            if (!contains_ipv4()) {
+                throw parsing_error("dns_nameserver(): no IPv4 addresses available");
+            }
+            return ipv4;
+        }
+        [[nodiscard]] std::vector<std::string> get_ipv6() const {
+            if (!contains_ipv6()) {
+                throw parsing_error("dns_nameserver(): no IPv6 addresses available");
+            }
+            return ipv6;
+        }
+        [[nodiscard]] bool contains_ipv4() const noexcept {
+            return !ipv4.empty();
+        }
+        [[nodiscard]] bool contains_ipv6() const noexcept {
+            return !ipv6.empty();
+        }
+    };
+#if defined(SSOCK_UNIX) && !defined(SSOCK_MACOS)
+    [[nodiscard]] inline dns_nameserver_list get_nameservers() {
+        if (!std::filesystem::exists("/etc/resolv.conf")) {
+            throw parsing_error("dns_nameserver(): /etc/resolv.conf does not exist");
+        }
+        std::ifstream file("/etc/resolv.conf");
+        if (!file.is_open()) {
+            throw parsing_error("failed to open /etc/resolv.conf");
+        }
+
+        std::vector<std::string> ipv4_addrs;
+        std::vector<std::string> ipv6_addrs;
+
+        std::string line;
+        while (std::getline(file, line)) {
+            size_t start = line.find_first_not_of(" \t");
+            if (start == std::string::npos) continue;
+            if (line.compare(start, 10, "nameserver") != 0) continue;
+
+            std::istringstream iss(line.substr(start));
+            std::string keyword, ip;
+            iss >> keyword >> ip;
+
+            if (!ip.empty() && ip.front() == '[' && ip.back() == ']') {
+                ip = ip.substr(1, ip.size() - 2);
+            }
+
+            if (ip.empty()) continue;
+            if (is_ipv4(ip)) {
+                ipv4_addrs.push_back(ip);
+            } else if (is_ipv6(ip)) {
+                ipv6_addrs.push_back(ip);
+            } else {
+                continue;
+            }
+        }
+
+        return {std::move(ipv4_addrs), std::move(ipv6_addrs)};
+    }
+#endif
+#ifdef SSOCK_MACOS
+    [[nodiscard]] inline dns_nameserver_list get_nameservers() {
+        SCDynamicStoreRef store = SCDynamicStoreCreate(nullptr, CFSTR("DNSReader"), nullptr, nullptr);
+        if (!store) {
+            throw parsing_error("failed to create SCDynamicStore");
+        }
+
+        auto dns_dict = static_cast<CFDictionaryRef>(SCDynamicStoreCopyValue(store, CFSTR("State:/Network/Global/DNS")));
+        if (!dns_dict) {
+            CFRelease(store);
+            throw parsing_error("failed to get DNS configuration");
+        }
+
+        auto servers = static_cast<CFArrayRef>(CFDictionaryGetValue(dns_dict, CFSTR("ServerAddresses")));
+        dns_nameserver_list result;
+
+        if (servers && CFGetTypeID(servers) == CFArrayGetTypeID()) {
+            CFIndex count = CFArrayGetCount(servers);
+            for (CFIndex i = 0; i < count; ++i) {
+                auto cf_ip = static_cast<CFStringRef>(CFArrayGetValueAtIndex(servers, i));
+                char ip_buf[256];
+                if (CFStringGetCString(cf_ip, ip_buf, sizeof(ip_buf), kCFStringEncodingUTF8)) {
+                    std::string ip(ip_buf);
+                    if (is_ipv4(ip)) {
+                        result.ipv4.push_back(ip);
+                    } else if (is_ipv6(ip)) {
+                        result.ipv6.push_back(ip);
+                    }
+                }
+            }
+        }
+
+        CFRelease(dns_dict);
+        CFRelease(store);
+        return result;
+    }
+#endif
+#ifdef SSOCK_WINDOWS
+    [[nodiscard]] inline dns_nameserver_list get_nameservers() {
+        std::vector<std::string> ipv4_addrs;
+        std::vector<std::string> ipv6_addrs;
+
+        ULONG bufsiz = 0;
+        DWORD result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &bufsiz);
+        if (result != ERROR_BUFFER_OVERFLOW) {
+            throw parsing_error("failed to get adapter buffer size");
+        }
+
+        std::vector<char> buffer(bufsiz);
+        IP_ADAPTER_ADDRESSES* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+
+        result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &bufsiz);
+        if (result != NO_ERROR) {
+            throw parsing_error("GetAdaptersAddresses failed");
+        }
+
+        for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
+            IP_ADAPTER_DNS_SERVER_ADDRESS* dns = adapter->FirstDnsServerAddress;
+            while (dns) {
+                char ipstr[INET6_ADDRSTRLEN] = {};
+                sockaddr* sa = dns->Address.lpSockaddr;
+
+                if (sa->sa_family == AF_INET) {
+                    auto sin = reinterpret_cast<sockaddr_in*>(sa);
+                    inet_ntop(AF_INET, &sin->sin_addr, ipstr, sizeof(ipstr));
+
+                    if (!is_ipv4(ipstr)) {
+                        dns = dns->Next;
+                        continue;
+                    }
+
+                    ipv4_addrs.emplace_back(ipstr);
+                } else if (sa->sa_family == AF_INET6) {
+                    auto sin6 = reinterpret_cast<sockaddr_in6*>(sa);
+                    inet_ntop(AF_INET6, &sin6->sin6_addr, ipstr, sizeof(ipstr));
+
+                    if (!is_ipv6(ipstr)) {
+                        dns = dns->Next;
+                        continue;
+                    }
+
+                    ipv6_addrs.emplace_back(ipstr);
+                }
+
+                dns = dns->Next;
+            }
+        }
+    }
+#endif
+    class dns_query_builder {
+        std::vector<uint8_t> packet;
+        uint16_t id;
+        bool recursion{true};
+
+        void encode_name(const std::string& name) {
+            size_t start = 0;
+            while (true) {
+                size_t pos = name.find('.', start);
+                if (pos == std::string::npos) pos = name.size();
+                size_t len = pos - start;
+                packet.push_back(static_cast<uint8_t>(len));
+                for (size_t i = 0; i < len; ++i) {
+                    packet.push_back(name[start + i]);
+                }
+                if (pos == name.size()) break;
+                start = pos + 1;
+            }
+            packet.push_back(0);
+        }
+        void write_uint16_t(uint16_t value) {
+            packet.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+            packet.push_back(static_cast<uint8_t>(value & 0xFF));
+        }
+        void write_uint32_t(uint32_t value) {
+            packet.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+            packet.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+        }
+    public:
+        explicit dns_query_builder(uint16_t _id = 0): id(_id) {
+            if (id == 0) {
+                static std::random_device rd;
+                static std::mt19937 gen(rd());
+                std::uniform_int_distribution<uint16_t> dis(1, 0xFFFF);
+                this->id = dis(gen);
+            }
+
+            packet.resize(12);
+
+            packet[0] = static_cast<uint8_t>((id >> 8) & 0xFF);
+            packet[1] = static_cast<uint8_t>(id & 0xFF);
+
+            uint16_t flags = recursion ? 0x0100 : 0x0000;
+            packet[2] = static_cast<uint8_t>((flags >> 8) & 0xFF);
+            packet[3] = static_cast<uint8_t>(flags & 0xFF);
+
+            for (int i = 4; i < 12; ++i) {
+                packet[i] = 0;
+            }
+        }
+
+        void set_recursion_desired(bool desired) {
+            recursion = desired;
+            uint16_t flags = recursion ? 0x0100 : 0x0000;
+            packet[2] = static_cast<uint8_t>((flags >> 8) & 0xFF);
+            packet[3] = static_cast<uint8_t>(flags & 0xFF);
+        }
+        void add_question(const std::string& name, network::dns::dns_record_type type = network::dns::dns_record_type::A, uint16_t record_class = 1) {
+            encode_name(name);
+            write_uint16_t(static_cast<uint16_t>(type));
+            write_uint16_t(record_class);
+
+            uint16_t qdcount = (packet[4] << 8) | packet[5];
+            ++qdcount;
+
+            packet[4] = static_cast<uint8_t>((qdcount >> 8) & 0xFF);
+            packet[5] = static_cast<uint8_t>(qdcount & 0xFF);
+        }
+        const std::vector<uint8_t>& build() {
+            return this->packet;
+        }
+    };
+
+    class dns_response_parser {
+        const std::vector<uint8_t>& data;
+        size_t offset = 0;
+
+        uint16_t read_uint16() {
+            uint16_t val = (data[offset] << 8) | data[offset + 1];
+            offset += 2;
+            return val;
+        }
+
+        uint32_t read_uint32() {
+            uint32_t val = (static_cast<uint32_t>(data[offset]) << 24) |
+                           (static_cast<uint32_t>(data[offset + 1]) << 16) |
+                           (static_cast<uint32_t>(data[offset + 2]) << 8) |
+                           (static_cast<uint32_t>(data[offset + 3]));
+            offset += 4;
+            return val;
+        }
+
+        std::string decode_name(size_t pos_override = std::string::npos) {
+            std::string name;
+            size_t pos = (pos_override == std::string::npos) ? offset : pos_override;
+            bool jumped = false;
+            size_t jump_offset = 0;
+
+            while (true) {
+                uint8_t len = data[pos];
+                if ((len & 0xC0) == 0xC0) {
+                    uint16_t pointer = ((len & 0x3F) << 8) | data[pos + 1];
+                    if (!jumped) jump_offset = pos + 2;
+                    pos = pointer;
+                    jumped = true;
+                    continue;
+                }
+
+                if (len == 0) {
+                    if (!jumped)
+                        offset = pos + 1;
+                    else
+                        offset = jump_offset;
+                    break;
+                }
+
+                if (!name.empty()) name += ".";
+                name += std::string(reinterpret_cast<const char*>(&data[pos + 1]), len);
+                pos += len + 1;
+            }
+
+            return name;
+        }
+
+    public:
+        explicit dns_response_parser(const std::vector<uint8_t>& bytes) : data(bytes) {
+            if (data.size() < 12) throw parsing_error("DNS response too short");
+        }
+
+        std::vector<network::dns::dns_record> parse() {
+            offset = 0;
+
+            read_uint16();
+            read_uint16();
+            uint16_t qdcount = read_uint16();
+            uint16_t ancount = read_uint16();
+            read_uint16();
+            read_uint16();
+
+            for (int i = 0; i < qdcount; ++i) {
+                decode_name();
+                read_uint16();
+                read_uint16();
+            }
+
+            std::vector<network::dns::dns_record> results;
+
+            for (int i = 0; i < ancount; ++i) {
+                std::string name = decode_name();
+                uint16_t type = read_uint16();
+                uint16_t record_class = read_uint16();
+                uint32_t ttl = read_uint32();
+                uint16_t rdlength = read_uint16();
+
+                if (type == 0) {
+                    throw parsing_error("DNS response contains a zero type record");
+                }
+
+                if (offset + rdlength > data.size()) {
+                    throw parsing_error("rdata length out of bounds");
+                }
+
+                network::dns::dns_record rec;
+                rec.name = std::move(name);
+                rec.record_class = record_class;
+                rec.ttl = ttl;
+
+                if (type == 1 && rdlength == 4) { // A
+                    char ipbuf[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &data[offset], ipbuf, sizeof(ipbuf));
+                    rec.type = network::dns::dns_record_type::A;
+                    rec.data = network::dns::a_record_data{{std::string(ipbuf), ""}};
+                    offset += rdlength;
+                } else if (type == 28 && rdlength == 16) { // AAAA
+                    char ipbuf[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, &data[offset], ipbuf, sizeof(ipbuf));
+                    rec.type = network::dns::dns_record_type::AAAA;
+                    rec.data = network::dns::aaaa_record_data{{"", std::string(ipbuf)}};
+                    offset += rdlength;
+                } else if (type == 5) { // CNAME
+                    auto saved_offset = offset;
+                    std::string cname_target = decode_name(offset);
+                    rec.type = network::dns::dns_record_type::CNAME;
+                    rec.data = network::dns::cname_record_data{std::move(cname_target)};
+                    offset = saved_offset + rdlength;
+                } else if (type == 15) {
+                    // MX
+                    if (rdlength < 3) throw parsing_error("malformed MX record");
+
+                    uint16_t preference = (data[offset] << 8) | data[offset + 1];
+                    auto saved_offset = offset;
+                    std::string exchange = decode_name(offset + 2);
+                    rec.type = network::dns::dns_record_type::MX;
+                    rec.data = network::dns::mx_record_data{preference, std::move(exchange)};
+                    offset = saved_offset + rdlength;
+                } else if (type == 2) { // NS
+                    auto saved_offset = offset;
+                    std::string nsdname = decode_name(offset);
+                    rec.type = network::dns::dns_record_type::NS;
+                    rec.data = network::dns::ns_record_data{std::move(nsdname)};
+                    offset = saved_offset + rdlength;
+                } else if (type == 16) { // TXT
+                    std::vector<std::string> texts;
+                    size_t end = offset + rdlength;
+                    while (offset < end) {
+                        uint8_t txt_len = data[offset++];
+                        if (offset + txt_len > end) {
+                            throw parsing_error("TXT record string length out of bounds");
+                        }
+                        texts.emplace_back(reinterpret_cast<const char*>(&data[offset]), txt_len);
+                        offset += txt_len;
+                    }
+                    rec.type = network::dns::dns_record_type::TXT;
+                    rec.data = network::dns::txt_record_data{std::move(texts)};
+                } else if (type == 33) { // SRV
+                    if (rdlength < 6) {
+                        throw parsing_error("SRV record too short");
+                    }
+
+                    uint16_t priority = read_uint16();
+                    uint16_t weight = read_uint16();
+                    uint16_t port = read_uint16();
+
+                    std::string target = decode_name();
+
+                    rec.type = network::dns::dns_record_type::SRV;
+                    rec.data = network::dns::srv_record_data{priority, weight, port, std::move(target)};
+                } else if (type == 12) { // PTR
+                    std::string ptr_name = decode_name();
+                    rec.type = network::dns::dns_record_type::PTR;
+                    rec.data = network::dns::ptr_record_data{std::move(ptr_name)};
+                } else if (type == 6) { // SOA
+                    std::string mname = decode_name();
+                    std::string rname = decode_name();
+
+                    uint32_t serial = read_uint32();
+                    uint32_t refresh = read_uint32();
+                    uint32_t retry = read_uint32();
+                    uint32_t expire = read_uint32();
+                    uint32_t minimum = read_uint32();
+
+                    rec.type = network::dns::dns_record_type::SOA;
+                    rec.data = network::dns::soa_record_data{
+                        std::move(mname),
+                        std::move(rname),
+                        serial,
+                        refresh,
+                        retry,
+                        expire,
+                        minimum
+                    };
+                } else {
+                    rec.type = network::dns::dns_record_type::OTHER;
+                    rec.data = network::dns::generic_record_data{
+                        type, std::vector<uint8_t>{data.begin() + static_cast<long>(offset), data.begin() + static_cast<long>(offset) + rdlength}
+                    };
+                    offset += rdlength;
+                }
+
+                results.push_back(std::move(rec));
+            }
+
+            return results;
+        }
+    };
+
+    class basic_dns_cache {
+    public:
+        basic_dns_cache() = default;
+        virtual ~basic_dns_cache() = default;
+        [[nodiscard]] virtual std::vector<network::dns::dns_record> lookup(const std::string& hostname) const = 0;
+        virtual void store(const std::string& hostname, const std::vector<network::dns::dns_record>& records) = 0;
+    };
+
+    class standard_dns_cache : basic_dns_cache {
+    public:
+        [[nodiscard]] std::vector<network::dns::dns_record> lookup(const std::string& hostname) const override {
+            std::ifstream is(utility::get_standard_cache_location(), std::ios::binary);
+            if (!is) {
+                return {};
+            }
+
+            while (is.peek() != EOF) {
+                std::string name = utility::read_string(is);
+
+                uint32_t count = 0;
+                utility::read(is, count);
+
+                std::vector<network::dns::dns_record> records;
+                records.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    records.push_back(network::dns::dns_record::deserialize(is));
+                }
+
+                if (name == hostname) {
+                    return records;
+                }
+            }
+
+            return {};
+        }
+        void store(const std::string& hostname, const std::vector<network::dns::dns_record>& new_records) override {
+            std::ifstream is(utility::get_standard_cache_location(), std::ios::binary);
+            std::vector<std::pair<std::string, std::vector<ssock::network::dns::dns_record>>> cache;
+
+            if (is) {
+                while (is.peek() != EOF) {
+                    std::string name = utility::read_string(is);
+                    uint32_t count = 0;
+                    utility::read(is, count);
+
+                    std::vector<ssock::network::dns::dns_record> records;
+                    records.reserve(count);
+                    for (uint32_t i = 0; i < count; ++i) {
+                        auto rec = ssock::network::dns::dns_record::deserialize(is);
+
+                        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()
+                        ).count();
+
+                        if (now_ms < rec.created_at + static_cast<int64_t>(rec.ttl) * 1000) {
+                            records.push_back(std::move(rec));
+                        }
+                    }
+
+                    cache.emplace_back(std::move(name), std::move(records));
+                }
+            }
+
+            auto it = std::ranges::find_if(cache, [&](const auto& pair) {
+                return pair.first == hostname;
+            });
+
+            std::vector<ssock::network::dns::dns_record> merged = new_records;
+
+            if (it != cache.end()) {
+                const auto& existing = it->second;
+
+                for (const auto& rec : existing) {
+                    auto dup = std::ranges::find_if(new_records, [&](const auto& r) {
+                        return r.name == rec.name &&
+                               r.type == rec.type &&
+                               r.record_class == rec.record_class &&
+                               r.data == rec.data;
+                    });
+
+                    if (dup == new_records.end()) {
+                        merged.push_back(rec);
+                    }
+                }
+
+                it->second = std::move(merged);
+            } else {
+                cache.emplace_back(hostname, merged);
+            }
+
+            std::ofstream os(utility::get_standard_cache_location(), std::ios::binary | std::ios::trunc);
+            if (!os) {
+                throw std::runtime_error("failed to open DNS cache file for writing");
+            }
+
+            for (const auto& [name, records] : cache) {
+                utility::write_string(os, name);
+                utility::write<uint32_t>(os, static_cast<uint32_t>(records.size()));
+                for (const auto& rec : records) {
+                    rec.serialize(os);
+                }
+            }
+        }
+    };
+
+    template <typename T = standard_dns_cache>
+    class basic_sync_dns_resolver {
+    public:
+        [[nodiscard]] virtual std::vector<network::dns::dns_record> query_records(const std::string& hostname, network::dns::dns_record_type type) const = 0;
+        explicit basic_sync_dns_resolver() = default;
+        explicit basic_sync_dns_resolver(const dns_nameserver_list&) {};
+        virtual ~basic_sync_dns_resolver() = default;
+    };
+
+    template <typename T = standard_dns_cache>
+    class sync_dns_resolver : basic_sync_dns_resolver<T> {
+        dns_nameserver_list list{};
+
+        void throw_if_invalid() const {
+            if (list.contains_ipv4() || list.contains_ipv6()) {
+                return;
+            }
+            throw parsing_error("sync_dns_resolver(): at least one IP address must be provided");
+        }
+    public:
+        explicit sync_dns_resolver(dns_nameserver_list list) : list(std::move(list)) {
+            throw_if_invalid();
+        }
+        sync_dns_resolver() : list(get_nameservers()) {
+            throw_if_invalid();
+        }
+
+        [[nodiscard]] std::vector<network::dns::dns_record> query_records(const std::string& hostname, network::dns::dns_record_type type) const override {
+            throw_if_invalid();
+
+            T cache{};
+            auto cached_records = cache.lookup(hostname);
+
+            std::vector<network::dns::dns_record> valid_cached_records;
+            auto now = std::chrono::system_clock::now();
+
+            for (const auto& record : cached_records) {
+                if (record.type != type) continue;
+
+                auto created_time = std::chrono::system_clock::time_point(std::chrono::milliseconds(record.created_at));
+                auto expiry_time = created_time + std::chrono::seconds(record.ttl);
+
+                if (expiry_time < now) {
+                    continue; // expired
+                }
+
+                valid_cached_records.push_back(record);
+            }
+
+            if (!valid_cached_records.empty()) {
+                return valid_cached_records;
+            }
+
+            dns_query_builder query_builder;
+            query_builder.add_question(hostname, type);
+            std::vector<unsigned char> query = query_builder.build();
+
+            bool successful = false;
+            std::vector<network::dns::dns_record> all_records;
+
+            auto try_query_on_server = [&](const std::string& server, ssock::sock::sock_addr_type addr_type) -> bool {
+                auto send_and_parse = [&](ssock::sock::sock_type s_type) -> bool {
+                    ssock::sock::sock_addr addr{server, 53, addr_type};
+                    ssock::sock::sync_sock sock(addr, s_type, ssock::sock::sock_opt::blocking | ssock::sock::sock_opt::no_delay);
+
+                    sock.connect();
+
+                    if (s_type == ssock::sock::sock_type::tcp) {
+                        uint16_t len = htons(static_cast<uint16_t>(query.size()));
+                        sock.send(reinterpret_cast<const char*>(&len), 2);
+                    }
+
+                    sock.send(reinterpret_cast<const char*>(query.data()), query.size());
+
+                    std::string response{};
+                    if (s_type == ssock::sock::sock_type::udp) {
+                        response = sock.recv(5, 512).data;
+                    } else {
+                        std::string len_buf;
+                        while (len_buf.size() < 2) {
+                            std::string chunk = sock.recv(2, 2 - len_buf.size()).data;
+                            if (chunk.empty()) {
+                                return false;
+                            }
+                            len_buf += chunk;
+                        }
+
+                        uint16_t resp_len = ntohs(*reinterpret_cast<const uint16_t*>(len_buf.data()));
+
+                        response.reserve(resp_len);
+                        size_t total_received = 0;
+                        while (total_received < resp_len) {
+                            size_t to_read = resp_len - total_received;
+                            std::string chunk = sock.recv(5, to_read).data;
+                            if (chunk.empty()) {
+                                return false;
+                            }
+                            total_received += chunk.size();
+                            response += chunk;
+                        }
+                    }
+
+                    if (response.size() < 12) return false;
+
+                    std::vector<uint8_t> response_bytes(response.begin(), response.end());
+                    if (s_type == ssock::sock::sock_type::udp && (response_bytes[2] & 0x02)) {
+                        return false;
+                    }
+
+                    dns_response_parser parser(response_bytes);
+                    auto records = parser.parse();
+
+                    all_records.insert(all_records.end(), records.begin(), records.end());
+
+                    return true;
+                };
+
+                try {
+                    if (send_and_parse(ssock::sock::sock_type::udp)) {
+                        return true;
+                    } else {
+                        return send_and_parse(ssock::sock::sock_type::tcp);
+                    }
+                } catch (...) {
+                    return false;
+                }
+            };
+
+            if (usable_ipv6_address_exists() && list.contains_ipv6()) {
+                for (const auto& server : list.get_ipv6()) {
+                    if (try_query_on_server(server, ssock::sock::sock_addr_type::ipv6)) {
+                        successful = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!successful && list.contains_ipv4()) {
+                for (const auto& server : list.get_ipv4()) {
+                    if (try_query_on_server(server, ssock::sock::sock_addr_type::ipv4)) {
+                        successful = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!successful) {
+                throw dns_error("All DNS queries failed.");
+            }
+
+            if (all_records.empty()) {
+                throw dns_error("No DNS records found for the hostname: " + hostname);
+            }
+
+            cache.store(hostname, all_records);
+
+            return all_records;
+        }
+    };
+}
+
+namespace ssock::internal_net {
+    [[nodiscard]] inline ssock::network::sock_ip_list get_a_aaaa_from_hostname(const std::string& hostname) {
+        if (hostname == "localhost") {
+            return {SSOCK_LOCALHOST_IPV4, SSOCK_LOCALHOST_IPV6};
+        }
+        auto nameservers = ssock::network::dns::get_nameservers();
+        if (nameservers.contains_ipv4() == false && nameservers.contains_ipv6() == false) {
+            nameservers = {
+                {SSOCK_FALLBACK_IPV4_DNS_1, SSOCK_FALLBACK_IPV4_DNS_2},
+                {SSOCK_FALLBACK_IPV6_DNS_1, SSOCK_FALLBACK_IPV6_DNS_2},
+            };
+        }
+
+        ssock::network::dns::sync_dns_resolver resolver(nameservers);
+
+        auto records = resolver.query_records(hostname, ssock::network::dns::dns_record_type::A);
+        auto records_v6 = resolver.query_records(hostname, ssock::network::dns::dns_record_type::AAAA);
+
+        std::string v4{};
+        std::string v6{};
+
+        records.insert(records.end(), records_v6.begin(), records_v6.end());
+
+        for (const auto& rec : records) {
+            std::visit([&v4, &v6]<typename T0>(T0&& data) {
+                using T = std::decay_t<T0>;
+                if constexpr (std::is_same_v<T, ssock::network::dns::a_record_data>) {
+                    v4 = data.ip.get_ipv4();
+                } else if constexpr (std::is_same_v<T, ssock::network::dns::aaaa_record_data>) {
+                    v6 = data.ip.get_ipv6();
+                }
+            }, rec.data);
+        }
+
+        if (v4.empty() && v6.empty()) {
+            throw ssock::dns_error("no valid A or AAAA records found for hostname: " + hostname);
+        }
+
+        return {v4, v6};
+    }
+}
+
 namespace ssock::http {
     /**
      * @brief HTTP version.
@@ -2465,9 +3631,18 @@ namespace ssock::http {
             std::string raw;
             std::string headers;
             while (true) {
-                std::string chunk = sock.recv(this->timeout, 8192);
-                if (chunk.empty()) throw std::runtime_error("connection closed during headers");
-                raw += chunk;
+                auto result = sock.recv(this->timeout, "\r\n\r\n", 0); // match headers end, no eof limit
+                if (result.status == sock::sock_recv_status::timeout) {
+                    throw std::runtime_error("timeout while reading headers");
+                }
+                if (result.status == sock::sock_recv_status::closed) {
+                    throw std::runtime_error("connection closed during headers");
+                }
+                if (result.data.empty()) {
+                    throw std::runtime_error("empty recv data unexpectedly");
+                }
+
+                raw += result.data;
                 if (auto pos = raw.find("\r\n\r\n"); pos != std::string::npos) {
                     headers = raw.substr(0, pos + 4);
                     raw = raw.substr(pos + 4);
@@ -2493,7 +3668,7 @@ namespace ssock::http {
             if (is_chunked) {
                 std::string chunked_data = std::move(raw);
                 while (chunked_data.find("0\r\n\r\n") == std::string::npos) {
-                    std::string chunk = sock.recv(this->timeout, 8192);
+                    std::string chunk = sock.recv(this->timeout, 8192).data;
                     if (chunk.empty()) throw std::runtime_error("connection closed during chunked body");
                     chunked_data += chunk;
                 }
@@ -2501,7 +3676,7 @@ namespace ssock::http {
             } else {
                 body = std::move(raw);
                 while (body.size() < content_length) {
-                    std::string chunk = sock.recv(this->timeout, 8192);
+                    std::string chunk = sock.recv(this->timeout, 8192).data;
                     if (chunk.empty()) throw std::runtime_error("connection closed during body");
                     body += chunk;
                 }
@@ -2905,7 +4080,7 @@ namespace ssock::http {
 
                 request req{};
                 std::string raw{};
-                std::string headers = client_sock->recv(5, "\r\n\r\n");
+                std::string headers = client_sock->recv(5, "\r\n\r\n").data;
                 if (headers.empty()) {
                     return;
                 }
@@ -2962,7 +4137,7 @@ namespace ssock::http {
                 if (is_chunked && (req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE")) {
                     std::string chunked;
                     while (chunked.find("0\r\n\r\n") == std::string::npos) {
-                        std::string chunk = client_sock->recv(5, 8192);
+                        std::string chunk = client_sock->recv(5, 8192).data;
                         if (chunk.empty()) {
                             break;
                         }
@@ -2976,7 +4151,7 @@ namespace ssock::http {
                     std::string body;
                     while (body.size() < content_length) {
                         size_t to_read = content_length - body.size();
-                        std::string chunk = client_sock->recv(30, (std::min)(to_read, static_cast<size_t>(8192)));
+                        std::string chunk = client_sock->recv(30, (std::min)(to_read, static_cast<size_t>(8192))).data;
                         if (chunk.empty()) {
                             break;
                         }

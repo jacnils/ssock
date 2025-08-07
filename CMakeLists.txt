@@ -24,9 +24,16 @@ if(WIN32)
             iphlpapi
             dnsapi
     )
-else()
+elseif(UNIX AND NOT APPLE)
     target_link_libraries(ssock INTERFACE
             resolv
+    )
+endif()
+if (APPLE)
+    target_link_libraries(ssock INTERFACE
+            resolv
+            "-framework SystemConfiguration"
+            "-framework CoreFoundation"
     )
 endif()
 
@@ -76,6 +83,12 @@ if (WIN32)
 else()
     target_link_libraries(ssock-build-test
             resolv
+    )
+endif()
+if (APPLE)
+    target_link_libraries(ssock-build-test
+            "-framework SystemConfiguration"
+            "-framework CoreFoundation"
     )
 endif()
 
