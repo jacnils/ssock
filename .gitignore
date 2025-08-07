@@ -1,1 +1,8 @@
+build/
+cmake-build*
 cmake-*
+docs/html
+docs/latex
+sessions/
+http_*.txt
+*DS_Store*
