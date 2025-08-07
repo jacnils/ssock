@@ -11,141 +11,8 @@ void test_socket() {
 
     sock.connect();
     sock.send("GET / HTTP/1.1\r\nHost: google.com\r\nConnection: close\r\n\r\n");
-    std::string response = sock.recv(-1);
+    std::string response = sock.recv(-1).data;
     std::cout << response << std::endl;
-}
-
-void test_dns(const std::string& hostname = "google.com") {
-    ssock::network::dns::dns_resolver resolver(hostname);
-    auto records = resolver.query_records(); // ANY query
-
-    for (const auto& rec : records) {
-        std::cout << "Name: " << rec.name << "\n";
-
-        std::visit([]<typename T0>(T0&& data) {
-            using T = std::decay_t<T0>;
-            if constexpr (std::is_same_v<T, std::monostate>)
-                std::cout << "(empty)\n";
-            else if constexpr (std::is_same_v<T, ssock::network::dns::a_record_data>) {
-                std::cout << "Type: A Record\n";
-                std::cout << "Value: " << data.ip.get_ipv4() << "\n";
-            } else if constexpr (std::is_same_v<T, ssock::network::dns::aaaa_record_data>) {
-                std::cout << "Type: AAAA Record\n";
-                std::cout << "Value: " << data.ip.get_ipv6() << "\n";
-            } else if constexpr (std::is_same_v<T, ssock::network::dns::cname_record_data>) {
-                std::cout << "Type: CNAME Record\n";
-                std::cout << "Value: " << data.cname << "\n";
-            } else if constexpr (std::is_same_v<T, ssock::network::dns::generic_record_data>) {
-                std::cout << "Type: Generic Record (" << data.type << ")\n";
-                for (const auto& byte : data.raw) {}
-            } else if constexpr (std::is_same_v<T, ssock::network::dns::txt_record_data>) {
-                std::cout << "Type: TXT Record\n";
-                for (const auto& text : data.text) {
-                    std::cout << "Value: " << text << "\n";
-                }
-            } else if constexpr (std::is_same_v<T, ssock::network::dns::mx_record_data>) {
-                std::cout << "Type: MX Record\n";
-                std::cout << "Preference: " << data.preference << "\n";
-                std::cout << "Exchange: " << data.exchange << "\n";
-            } else if constexpr (std::is_same_v<T, ssock::network::dns::ns_record_data>) {
-                std::cout << "Type: NS Record\n";
-                std::cout << "NS: " << data.ns << "\n";
-                // more can be added here as needed
-            } else {
-                std::cout << "Type: Unknown Record\n";
-            }
-        }, rec.data);
-        std::cout << "---------------------\n";
-    }
-}
-
-void test_dns_steps(const std::string& hostname = "google.com") {
-    ssock::network::dns::dns_resolver resolver(hostname);
-    auto addresses = resolver.resolve_hostname();
-
-    std::cout << "Resolved IPs for " << hostname << ":\n";
-    if (addresses.contains_ipv4()) {
-        std::cout << "IPv4: " << addresses.get_ipv4() << "\n";
-    } else {
-        std::cout << "No IPv4 address found.\n";
-    }
-    if (addresses.contains_ipv6()) {
-        std::cout << "IPv6: " << addresses.get_ipv6() << "\n";
-    } else {
-        std::cout << "No IPv6 address found.\n";
-    }
-
-    // manually query each instead of an ANY query
-    auto a_records = resolver.query_records(ssock::network::dns::dns_record_type::A);
-    auto aaaa_records = resolver.query_records(ssock::network::dns::dns_record_type::AAAA);
-    auto cname_records = resolver.query_records(ssock::network::dns::dns_record_type::CNAME);
-    auto txt_records = resolver.query_records(ssock::network::dns::dns_record_type::TXT);
-    auto mx_records = resolver.query_records(ssock::network::dns::dns_record_type::MX);
-    auto ns_records = resolver.query_records(ssock::network::dns::dns_record_type::NS);
-    std::cout << "\nA Records:\n";
-    for (const auto& rec : a_records) {
-        std::cout << "Name: " << rec.name << "\n";
-        if (std::holds_alternative<ssock::network::dns::a_record_data>(rec.data)) {
-            auto data = std::get<ssock::network::dns::a_record_data>(rec.data);
-            std::cout << "Type: A Record\n";
-            std::cout << "Value: " << data.ip.get_ipv4() << "\n";
-        }
-        std::cout << "---------------------\n";
-    }
-    std::cout << "\nAAAA Records:\n";
-    for (const auto& rec : aaaa_records) {
-        std::cout << "Name: " << rec.name << "\n";
-        if (std::holds_alternative<ssock::network::dns::aaaa_record_data>(rec.data)) {
-            auto data = std::get<ssock::network::dns::aaaa_record_data>(rec.data);
-            std::cout << "Type: AAAA Record\n";
-            std::cout << "Value: " << data.ip.get_ipv6() << "\n";
-        }
-        std::cout << "---------------------\n";
-    }
-    std::cout << "\nCNAME Records:\n";
-    for (const auto& rec : cname_records) {
-        std::cout << "Name: " << rec.name << "\n";
-        if (std::holds_alternative<ssock::network::dns::cname_record_data>(rec.data)) {
-            auto data = std::get<ssock::network::dns::cname_record_data>(rec.data);
-            std::cout << "Type: CNAME Record\n";
-            std::cout << "Value: " << data.cname << "\n";
-        }
-        std::cout << "---------------------\n";
-    }
-    std::cout << "\nTXT Records:\n";
-    for (const auto& rec : txt_records) {
-        std::cout << "Name: " << rec.name << "\n";
-        if (std::holds_alternative<ssock::network::dns::txt_record_data>(rec.data)) {
-            auto data = std::get<ssock::network::dns::txt_record_data>(rec.data);
-            std::cout << "Type: TXT Record\n";
-            for (const auto& text : data.text) {
-                std::cout << "Value: " << text << "\n";
-            }
-        }
-        std::cout << "---------------------\n";
-    }
-    std::cout << "\nMX Records:\n";
-    for (const auto& rec : mx_records) {
-        std::cout << "Name: " << rec.name << "\n";
-        if (std::holds_alternative<ssock::network::dns::mx_record_data>(rec.data)) {
-            auto data = std::get<ssock::network::dns::mx_record_data>(rec.data);
-            std::cout << "Type: MX Record\n";
-            std::cout << "Preference: " << data.preference << "\n";
-            std::cout << "Exchange: " << data.exchange << "\n";
-        }
-        std::cout << "---------------------\n";
-    }
-    std::cout << "\nNS Records:\n";
-    for (const auto& rec : ns_records) {
-        std::cout << "Name: " << rec.name << "\n";
-        if (std::holds_alternative<ssock::network::dns::ns_record_data>(rec.data)) {
-            auto data = std::get<ssock::network::dns::ns_record_data>(rec.data);
-            std::cout << "Type: NS Record\n";
-            std::cout << "NS: " << data.ns << "\n";
-        }
-        std::cout << "---------------------\n";
-    }
-    std::cout << "\n";
 }
 
 void test_http_server() {
@@ -162,7 +29,7 @@ void test_http_server() {
         std::cout << "New connection accepted." << std::endl;
         try {
             // receive data from the client
-            std::string request = client_sock->recv(-1, "\r\n\r\n");
+            std::string request = client_sock->recv(-1, "\r\n\r\n").data;
             std::cout << "Received request:\n" << request << std::endl;
 
             // send a simple HTTP response
@@ -227,42 +94,128 @@ void test_http_abstr() {
     }
 }
 
-void test_get_dns_nameservers() {
-    auto nameservers = ssock::network::experimental::dns::get_nameservers();
+void test_get_dns_nameservers(const std::string& hostname) {
+    auto nameservers = ssock::network::dns::get_nameservers();
 
+    std::cout << "Standard location:\n";
+    std::cout << ssock::utility::get_standard_cache_location() << "\n";
     std::cout << "Nameservers:\n";
-    if (nameservers.has_ipv4()) {
+    if (nameservers.contains_ipv4()) {
         for (const auto& it : nameservers.get_ipv4()) {
             std::cout << "IPv4: " << it << "\n";
         }
     }
-    if (nameservers.has_ipv6()) {
+    if (nameservers.contains_ipv6()) {
         for (const auto& it : nameservers.get_ipv6()) {
             std::cout << "IPv6: " << it << "\n";
         }
     }
 
     /* overriding:
-    nameservers = ssock::network::experimental::dns::dns_nameserver_list{
+    nameservers = ssock::network::dns::dns_nameserver_list{
         {"8.8.8.8"}, {}
     };
     */
 
-    ssock::network::experimental::dns::sync_dns_resolver resolver(nameservers);
-    auto list = resolver.resolve_hostname("google.com");
-    std::cout << "Resolved IPs for google.com:\n";
-    if (list.contains_ipv4()) {
-        std::cout << "IPv4: " << list.get_ipv4() << "\n";
-    } else {
-        std::cout << "No IPv4 address found.\n";
-    }
-    if (list.contains_ipv6()) {
-        std::cout << "IPv6: " << list.get_ipv6() << "\n";
-    } else {
-        std::cout << "No IPv6 address found.\n";
+    ssock::network::dns::sync_dns_resolver resolver(nameservers);
+    auto types = std::vector<ssock::network::dns::dns_record_type> {
+        ssock::network::dns::dns_record_type::A,
+        ssock::network::dns::dns_record_type::AAAA,
+        ssock::network::dns::dns_record_type::CNAME,
+        ssock::network::dns::dns_record_type::TXT,
+        ssock::network::dns::dns_record_type::MX,
+        ssock::network::dns::dns_record_type::NS,
+    };
+
+    for (const auto& type : types) {
+        std::vector<ssock::network::dns::dns_record> records;
+        try {
+            records = resolver.query_records(hostname, type);
+        } catch (const ssock::dns_error& e) {
+            // probably means no records
+            continue;
+        }
+
+        for (const auto& rec : records) {
+            std::cout << "Name: " << rec.name << "\n";
+
+            std::visit([]<typename T0>(T0&& data) {
+                using T = std::decay_t<T0>;
+                if constexpr (std::is_same_v<T, std::monostate>)
+                    std::cout << "(empty)\n";
+                else if constexpr (std::is_same_v<T, ssock::network::dns::a_record_data>) {
+                    std::cout << "Type: A Record\n";
+                    std::cout << "Value: " << data.ip.get_ipv4() << "\n";
+                } else if constexpr (std::is_same_v<T, ssock::network::dns::aaaa_record_data>) {
+                    std::cout << "Type: AAAA Record\n";
+                    std::cout << "Value: " << data.ip.get_ipv6() << "\n";
+                } else if constexpr (std::is_same_v<T, ssock::network::dns::cname_record_data>) {
+                    std::cout << "Type: CNAME Record\n";
+                    std::cout << "Value: " << data.cname << "\n";
+                } else if constexpr (std::is_same_v<T, ssock::network::dns::generic_record_data>) {
+                    std::cout << "Type: Generic Record (" << data.type << ")\n";
+                    for (const auto& byte : data.raw) {}
+                } else if constexpr (std::is_same_v<T, ssock::network::dns::txt_record_data>) {
+                    std::cout << "Type: TXT Record\n";
+                    for (const auto& text : data.text) {
+                        std::cout << "Value: " << text << "\n";
+                    }
+                } else if constexpr (std::is_same_v<T, ssock::network::dns::mx_record_data>) {
+                    std::cout << "Type: MX Record\n";
+                    std::cout << "Preference: " << data.preference << "\n";
+                    std::cout << "Exchange: " << data.exchange << "\n";
+                }
+            }, rec.data);
+            std::cout << "---------------------\n";
+        }
     }
 }
 
+void test_dns_any(const std::string& hostname = "google.com", ssock::network::dns::dns_record_type type = ssock::network::dns::dns_record_type::ANY) {
+    auto nameservers = ssock::network::dns::get_nameservers();
+    nameservers = ssock::network::dns::dns_nameserver_list{
+            {"8.8.8.8"}, {}
+    };
+    ssock::network::dns::sync_dns_resolver resolver(nameservers);
+
+    auto records = resolver.query_records(hostname, type);
+
+    std::cout << "ANY Records for " << hostname << ":\n";
+    for (const auto& rec : records) {
+        std::cout << "Name: " << rec.name << "\n";
+
+        std::visit([]<typename T0>(T0&& data) {
+            using T = std::decay_t<T0>;
+            if constexpr (std::is_same_v<T, std::monostate>)
+                std::cout << "(empty)\n";
+            else if constexpr (std::is_same_v<T, ssock::network::dns::a_record_data>) {
+                std::cout << "Type: A Record\n";
+                std::cout << "Value: " << data.ip.get_ipv4() << "\n";
+            } else if constexpr (std::is_same_v<T, ssock::network::dns::aaaa_record_data>) {
+                std::cout << "Type: AAAA Record\n";
+                std::cout << "Value: " << data.ip.get_ipv6() << "\n";
+            } else if constexpr (std::is_same_v<T, ssock::network::dns::cname_record_data>) {
+                std::cout << "Type: CNAME Record\n";
+                std::cout << "Value: " << data.cname << "\n";
+            } else if constexpr (std::is_same_v<T, ssock::network::dns::generic_record_data>) {
+                std::cout << "Type: Generic Record (" << data.type << ")\n";
+                for (const auto& byte : data.raw) {}
+            } else if constexpr (std::is_same_v<T, ssock::network::dns::txt_record_data>) {
+                std::cout << "Type: TXT Record\n";
+                for (const auto& text : data.text) {
+                    std::cout << "Value: " << text << "\n";
+                }
+            } else if constexpr (std::is_same_v<T, ssock::network::dns::mx_record_data>) {
+                std::cout << "Type: MX Record\n";
+                std::cout << "Preference: " << data.preference << "\n";
+                std::cout << "Exchange: " << data.exchange << "\n";
+            }
+        }, rec.data);
+        std::cout << "---------------------\n";
+    }
+}
+
+/*
 int main() {
    std::cout << "ssock.hpp" << std::endl;
    test_socket();
@@ -284,10 +237,22 @@ int main() {
    std::this_thread::sleep_for(std::chrono::seconds(1)); // give the server time to start
    test_http_abstr();
 
-   test_get_dns_nameservers();
+   test_get_dns_nameservers("google.com");
+   test_get_dns_nameservers("forwarderfactory.com");
+
+   test_dns_any("google.com", ssock::network::dns::dns_record_type::A);
+   test_dns_any("google.com", ssock::network::dns::dns_record_type::AAAA);
+   test_dns_any("google.com", ssock::network::dns::dns_record_type::TXT);
    std::cout << "---- END OF CLIENT TESTS ----" << std::endl;
 
    test_http_abstr_2();
 
    return EXIT_SUCCESS;
+}
+*/
+int main() {
+    test_get_dns_nameservers("google.com");
+    test_get_dns_nameservers("forwarderfactory.com");
+    test_get_dns_nameservers("jacobnilsson.com");
+    test_get_dns_nameservers("github.com");
 }
