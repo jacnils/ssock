@@ -5,7 +5,7 @@ Simple library providing modernized, safe Unix-style sockets, HTTP abstraction, 
 ## Features
 
 - Binding, connecting, sending, receiving and closing synchronous sockets
-- (Basic) HTTP body parser, including headers and body.
+- HTTP/1.0 and HTTP/1.1 body parser, including headers and body.
 - IPv4 and IPv6 support
 - TCP and UDP support
 - DNS resolution*
