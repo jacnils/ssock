@@ -35,7 +35,7 @@ int main() {
      * You can also use recv() to receive data from the server.
      * The timeout is set to -1, which means no timeout. You can change it to a positive value if needed.
      */
-    std::string response = sock.recv(-1);
+    std::string response = sock.recv(-1).data;
     /* This will close the connection. This will be done automatically for you by the destructor, but I'm
      * calling it manually here just to show that it can be manually invoked if needed.
      */

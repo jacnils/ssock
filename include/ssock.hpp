@@ -2319,7 +2319,7 @@ namespace ssock::sock {
             while (true) {
                 auto elapsed = std::chrono::steady_clock::now() - start;
                 auto remaining = std::chrono::seconds(timeout_seconds) - elapsed;
-                if (remaining <= std::chrono::seconds(0)) {
+                if (remaining <= std::chrono::seconds(0) && timeout_seconds != -1) {
                     return {data, sock_recv_status::timeout};
                 }
 
@@ -2331,7 +2331,8 @@ namespace ssock::sock {
                 FD_ZERO(&readfds);
                 FD_SET(this->sockfd, &readfds);
 
-                int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr, &tv);
+                if (this->sockfd < 0) throw socket_error("invalid socket descriptor");
+                int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr, timeout_seconds == -1 ? nullptr : &tv);
                 if (ret < 0) {
                     throw socket_error("select() failed");
                 }
@@ -2375,7 +2376,10 @@ namespace ssock::sock {
             while (true) {
                 auto elapsed = std::chrono::steady_clock::now() - start;
                 auto remaining = std::chrono::seconds(timeout_seconds) - elapsed;
-                if (remaining <= std::chrono::seconds(0)) {
+                if (timeout_seconds == -1) {
+                    remaining = std::chrono::seconds::max();
+                }
+                if (remaining <= std::chrono::seconds(0) && timeout_seconds != -1) {
                     return {data, sock_recv_status::timeout};
                 }
 
@@ -2387,7 +2391,9 @@ namespace ssock::sock {
                 FD_ZERO(&readfds);
                 FD_SET(this->sockfd, &readfds);
 
-                int ret = ::select(this->sockfd + 1, &readfds, nullptr, nullptr, &tv);
+                if (this->sockfd < 0) throw socket_error("invalid socket descriptor");
+
+                int ret = ::select(this->sockfd + 1, &readfds, nullptr, nullptr, timeout_seconds == -1 ? nullptr : &tv);
                 if (ret == SOCKET_ERROR) {
                     throw socket_error("select() failed");
                 }
