@@ -1882,6 +1882,8 @@ namespace ssock::sock {
         [[nodiscard]] virtual sock_recv_result recv(int timeout_seconds, const std::string& match) const = 0;
         [[nodiscard]] virtual sock_recv_result recv(int timeout_seconds, const std::string& match, size_t eof) const = 0;
         [[nodiscard]] virtual sock_recv_result recv(int timeout_seconds, size_t eof) const = 0;
+        [[nodiscard]] virtual std::string overflow_bytes() const = 0;
+        virtual void clear_overflow_bytes() const = 0;
         virtual void close() = 0;
     };
 
@@ -1894,6 +1896,7 @@ namespace ssock::sock {
         sock_fd_t sockfd{};
         sockaddr_storage sa_storage{};
         bool bound{false};
+        mutable std::string old_bytes;
 
         [[nodiscard]] const sockaddr* get_sa() const {
             return reinterpret_cast<const sockaddr*>(&sa_storage);
@@ -2304,6 +2307,23 @@ namespace ssock::sock {
         void send(const std::string& buf) override {
             static_cast<void>(this->send(buf.c_str(), buf.length()));
         }
+
+        /**
+         * @brief Returns bytes that were read, further than the requested length (as defined by the eof parameter in recv()).
+         * @note This does NOT need to be called if you intend to call recv() again, as recv() prepends these bytes automatically.
+         * @note Call clear_overflow_bytes() after calling, if you do not want recv() to use these bytes again.
+         * @return std::string of overflow bytes.
+         */
+        [[nodiscard]] std::string overflow_bytes() const override {
+            return old_bytes;
+        }
+        /**
+         * @brief Clear the overflow bytes buffer.
+         * @note This does NOT need to be called if you intend to call recv() again, as recv() prepends these bytes automatically.
+         */
+        void clear_overflow_bytes() const override {
+            old_bytes.clear();
+        }
         /**
          * @brief Receive data from the server.
          * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely until match is found)
@@ -2313,7 +2333,26 @@ namespace ssock::sock {
          */
 #ifdef SSOCK_UNIX
         [[nodiscard]] sock_recv_result recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
-            std::string data;
+            std::string data = old_bytes;
+            old_bytes.clear();
+
+            if (eof != 0 && data.size() >= eof) {
+                if (data.size() > eof) {
+                    old_bytes = data.substr(eof);
+                    data.resize(eof);
+                }
+                return {data, sock_recv_status::success};
+            }
+
+            if (!match.empty()) {
+                size_t pos = data.find(match);
+                if (pos != std::string::npos) {
+                    old_bytes = data.substr(pos + match.size());
+                    data.resize(pos + match.size());
+                    return {data, sock_recv_status::success};
+                }
+            }
+
             auto start = std::chrono::steady_clock::now();
 
             while (true) {
@@ -2332,13 +2371,10 @@ namespace ssock::sock {
                 FD_SET(this->sockfd, &readfds);
 
                 if (this->sockfd < 0) throw socket_error("invalid socket descriptor");
-                int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr, timeout_seconds == -1 ? nullptr : &tv);
-                if (ret < 0) {
-                    throw socket_error("select() failed");
-                }
-                if (ret == 0) {
-                    return {data, sock_recv_status::timeout};
-                }
+                int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr,
+                                                       timeout_seconds == -1 ? nullptr : &tv);
+                if (ret < 0) throw socket_error("select() failed");
+                if (ret == 0) return {data, sock_recv_status::timeout};
 
                 if (FD_ISSET(this->sockfd, &readfds)) {
                     size_t bytes_to_read = 8192;
@@ -2352,17 +2388,25 @@ namespace ssock::sock {
                         if (errno == EINTR) continue;
                         throw socket_error("recv() failed");
                     }
-                    if (received == 0) {
-                        return {data, sock_recv_status::closed};
-                    }
+                    if (received == 0) return {data, sock_recv_status::closed};
 
                     data.append(buf, static_cast<std::size_t>(received));
 
+                    if (eof != 0 && data.length() > eof) {
+                        old_bytes = data.substr(eof);
+                        data.resize(eof);
+                    }
                     if (eof != 0 && data.length() >= eof) {
                         return {data, sock_recv_status::success};
                     }
-                    if (!match.empty() && data.find(match) != std::string::npos) {
-                        return {data, sock_recv_status::success};
+
+                    if (!match.empty()) {
+                        size_t pos = data.find(match);
+                        if (pos != std::string::npos) {
+                            old_bytes = data.substr(pos + match.size());
+                            data.resize(pos + match.size());
+                            return {data, sock_recv_status::success};
+                        }
                     }
                 }
             }
@@ -2370,7 +2414,26 @@ namespace ssock::sock {
 #endif
 #ifdef SSOCK_WINDOWS
         [[nodiscard]] sock_recv_result recv(const int timeout_seconds, const std::string& match, size_t eof) const override {
-            std::string data;
+            std::string data = old_bytes;
+            old_bytes.clear();
+
+            if (eof != 0 && data.size() >= eof) {
+                if (data.size() > eof) {
+                    old_bytes = data.substr(eof);
+                    data.resize(eof);
+                }
+                return {data, sock_recv_status::success};
+            }
+
+            if (!match.empty()) {
+                size_t pos = data.find(match);
+                if (pos != std::string::npos) {
+                    old_bytes = data.substr(pos + match.size());
+                    data.resize(pos + match.size());
+                    return {data, sock_recv_status::success};
+                }
+            }
+
             auto start = std::chrono::steady_clock::now();
 
             while (true) {
@@ -2420,16 +2483,27 @@ namespace ssock::sock {
 
                     data.append(buf, static_cast<std::size_t>(received));
 
-                    if (eof != 0 && data.size() >= eof) {
+                    if (eof != 0 && data.length() > eof) {
+                        old_bytes = data.substr(eof);
+                        data.resize(eof);
+                    }
+                    if (eof != 0 && data.length() >= eof) {
                         return {data, sock_recv_status::success};
                     }
-                    if (!match.empty() && data.find(match) != std::string::npos) {
-                        return {data, sock_recv_status::success};
+
+                    if (!match.empty()) {
+                        size_t pos = data.find(match);
+                        if (pos != std::string::npos) {
+                            old_bytes = data.substr(pos + match.size());
+                            data.resize(pos + match.size());
+                            return {data, sock_recv_status::success};
+                        }
                     }
                 }
             }
         }
 #endif
+
         /* @brief Receive data from the server.
          * @param timeout_seconds The timeout in seconds (-1 means wait indefinitely).
          * @return The received data as a sock_recv_result
@@ -3294,7 +3368,7 @@ namespace ssock::network::dns {
 }
 
 namespace ssock::internal_net {
-    [[nodiscard]] inline ssock::network::sock_ip_list get_a_aaaa_from_hostname(const std::string& hostname) {
+    [[nodiscard]] inline network::sock_ip_list get_a_aaaa_from_hostname(const std::string& hostname) {
         if (hostname == "localhost") {
             return {SSOCK_LOCALHOST_IPV4, SSOCK_LOCALHOST_IPV6};
         }
@@ -3682,9 +3756,9 @@ namespace ssock::http {
             } else {
                 body = std::move(raw);
                 while (body.size() < content_length) {
-                    std::string chunk = sock.recv(this->timeout, 8192).data;
-                    if (chunk.empty()) throw std::runtime_error("connection closed during body");
-                    body += chunk;
+                    auto res = sock.recv(30, "", 0);
+                    if (res.data.empty()) break;
+                    body += res.data;
                 }
             }
 
@@ -3990,8 +4064,7 @@ namespace ssock::http {
 
         using request_callback = std::function<response(const request&)>;
 
-        template <typename T = http::body_parser<std::string>,
-                  typename S = server_settings>
+        template <typename S = server_settings>
         class basic_request_handler {
         public:
             basic_request_handler() = default;
@@ -3999,9 +4072,7 @@ namespace ssock::http {
             virtual ~basic_request_handler() = default;
         };
 
-        template <typename T = http::body_parser<std::string>,
-                  typename S = server_settings
-                 >
+        template <typename S = server_settings>
         class request_handler : basic_request_handler<> {
             static std::vector<cookie> get_cookies_from_request(const std::string& cookie_header) {
                 std::vector<cookie> cookies;
@@ -4071,6 +4142,47 @@ namespace ssock::http {
 
                 file.close();
             }
+
+            [[nodiscard]] static std::vector<std::pair<std::string, std::string>> get_headers(const std::string& header_part) {
+                std::vector<std::pair<std::string,std::string>> headers_vec;
+                std::istringstream hs(header_part);
+                std::string l{};
+                while (std::getline(hs, l) && l != "\r") {
+                    if (l.back() == '\r') l.pop_back();
+                    auto cpos = l.find(':');
+                    if (cpos != std::string::npos) {
+                        auto key = l.substr(0, cpos);
+                        auto value = l.substr(cpos + 1);
+                        auto trim = [](std::string& s) {
+                            s.erase(0, s.find_first_not_of(" \t"));
+                            s.erase(s.find_last_not_of(" \t") + 1);
+                        };
+                        trim(key);
+                        trim(value);
+                        headers_vec.emplace_back(key, value);
+                    }
+                }
+
+                return headers_vec;
+            }
+
+            struct status_line {
+                std::string method{"GET"};
+                std::string path{"/"};
+                std::string http_version{"HTTP/1.1"};
+            };
+
+            status_line get_status_line(const std::string& header_part) const {
+                status_line line{};
+                std::istringstream hs(header_part);
+                std::string first_line{};
+                if (std::getline(hs, first_line)) {
+                    if (first_line.back() == '\r') first_line.pop_back();
+                    std::istringstream line_ss(first_line);
+                    line_ss >> line.method >> line.path >> line.http_version;
+                }
+                return line;
+            }
         public:
             void handle(std::unique_ptr<sock::sync_sock>& client_sock, server_settings& settings, const request_callback& callback) const override {
                 if (!client_sock) {
@@ -4087,14 +4199,17 @@ namespace ssock::http {
                 request req{};
                 std::string raw{};
                 std::string headers = client_sock->recv(5, "\r\n\r\n").data;
+                const auto headers_vec = get_headers(headers);
                 if (headers.empty()) {
                     return;
                 }
                 raw += headers;
 
                 bool is_chunked = false;
-                bool expect_continue = false;
                 std::size_t content_length = 0;
+
+                auto status_line = get_status_line(headers);
+                req.method = status_line.method;
 
                 std::istringstream header_stream(headers);
                 std::string line;
@@ -4108,7 +4223,7 @@ namespace ssock::http {
                             break;
                         }
                     } else if (line.starts_with("Expect:") && line.find("100-continue") != std::string::npos) {
-                        expect_continue = true;
+                        client_sock->send("HTTP/1.1 100 Continue\r\n\r\n");
                     } else if (line.starts_with("Expect:") && line.find("100-continue") == std::string::npos) {
                         std::string response = "HTTP/1.1 417 Expectation Failed\r\n"
                             "Content-Length: 0\r\n"
@@ -4136,34 +4251,35 @@ namespace ssock::http {
                     }
                 }
 
-                if (expect_continue) {
-                    client_sock->send("HTTP/1.1 100 Continue\r\n\r\n");
-                }
-
                 if (is_chunked && (req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE")) {
-                    std::string chunked;
+                    std::string chunked = client_sock->overflow_bytes();
+                    client_sock->clear_overflow_bytes();
+
                     while (chunked.find("0\r\n\r\n") == std::string::npos) {
-                        std::string chunk = client_sock->recv(5, 8192).data;
-                        if (chunk.empty()) {
-                            break;
-                        }
-                        chunked += chunk;
+                        auto res = client_sock->recv(5, "", 0); // no eof
+                        if (res.status == sock::sock_recv_status::closed) break;
+                        if (res.status == sock::sock_recv_status::timeout) throw socket_error("recv timeout");
+                        if (res.data.empty()) continue;
+                        chunked += res.data;
                     }
 
                     std::string decoded = utility::decode_chunked(chunked);
                     raw = headers + decoded;
                     req.raw_body = raw;
+                    req.body = decoded;
                 } else if (req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE") {
-                    std::string body;
+                    std::string body = client_sock->overflow_bytes();
+                    client_sock->clear_overflow_bytes();
+
                     while (body.size() < content_length) {
-                        size_t to_read = content_length - body.size();
-                        std::string chunk = client_sock->recv(30, (std::min)(to_read, static_cast<size_t>(8192))).data;
-                        if (chunk.empty()) {
-                            break;
-                        }
-                        body += chunk;
+                        auto res = client_sock->recv(30, "", 0);
+                        if (res.status == sock::sock_recv_status::closed) break;
+                        if (res.status == sock::sock_recv_status::timeout) throw socket_error("recv timeout");
+                        if (res.data.empty()) continue;
+                        body += res.data;
                     }
 
+                    req.body = body;
                     req.raw_body = headers + body;
                 } else {
                     req.raw_body = headers;
@@ -4173,10 +4289,9 @@ namespace ssock::http {
                     return;
                 }
 
-                auto parsed = T(req.raw_body).parse();
                 req.ip_address = [&]() -> std::string {
                     if (settings.trust_x_forwarded_for) {
-                        for (const auto& it : parsed.headers) {
+                        for (const auto& it : headers_vec) {
                             if (it.first == "X-Forwarded-For") {
                                 auto ips = ssock::utility::split(it.second, ",");
                                 for (const auto& ip : ips) {
@@ -4202,21 +4317,16 @@ namespace ssock::http {
                     return;
                 }
 
-                req.body = parsed.body;
                 req.version = [&]() {
-                    if (parsed.status_line.version == "HTTP/1.0") {
+                    if (status_line.http_version == "HTTP/1.0") {
                         return 10;
-                    } else if (parsed.status_line.version == "HTTP/1.1") {
+                    } else if (status_line.http_version == "HTTP/1.1") {
                         return 11;
                     } else {
-                        throw parsing_error("unsupported HTTP version: " + parsed.status_line.version);
+                        throw parsing_error("unsupported HTTP version: " + status_line.http_version);
                     }
                 }();
-                req.method = parsed.status_line.method;
-                if (req.method.empty()) {
-                    throw parsing_error("invalid HTTP method: " + parsed.status_line.method);
-                }
-                auto full_path = parsed.status_line.path;
+                auto full_path = status_line.path;
                 if (full_path.empty() || full_path[0] != '/') {
                     throw parsing_error("invalid path: " + full_path);
                 }
@@ -4230,7 +4340,7 @@ namespace ssock::http {
                 }
 
                 req.fields = ssock::utility::parse_fields(req.body);
-                for (const auto& it : parsed.headers) {
+                for (const auto& it : headers_vec) {
                     if (it.first == "Content-Type") {
                         req.content_type = it.second;
                     } else if (it.first == "User-Agent") {
