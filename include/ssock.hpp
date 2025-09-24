@@ -20,6 +20,7 @@
 #include <functional>
 #include <random>
 #include <filesystem>
+#include <thread>
 
 #ifndef SSOCK
 #define SSOCK 1
@@ -1893,7 +1894,7 @@ namespace ssock::sock {
     class sync_sock : basic_sync_sock {
         sock_addr addr;
         sock_type type{};
-        sock_fd_t sockfd{};
+        sock_fd_t sockfd{-1};
         sockaddr_storage sa_storage{};
         bool bound{false};
         mutable std::string old_bytes;
@@ -2039,6 +2040,8 @@ namespace ssock::sock {
          */
 #ifdef SSOCK_UNIX
         sync_sock(const sock_addr& addr, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking) : addr(addr), type(t) {
+            this->sockfd = -1;
+
             if (addr.get_ip().empty() && !addr.is_file_path()) {
                 throw socket_error("IP address/file path is empty");
             }
@@ -2054,7 +2057,30 @@ namespace ssock::sock {
                 throw socket_error("failed to create socket");
             }
 
-            this->set_sock_opts(opts);
+            if (this->sockfd >= 0) {
+                this->set_sock_opts(opts);
+            } else {
+                throw socket_error("cannot set options on invalid socket");
+            }
+
+            this->prep_sa();
+        }
+        /**
+         * @brief Constructs a sync_sock object from an existing file descriptor.
+         * @param existing_fd The existing file descriptor.
+         * @param peer The peer address of the socket.
+         * @param t The socket type (tcp, udp, unix).
+         * @param opts The socket options (reuse_addr, no_reuse_addr).
+         */
+        sync_sock(int existing_fd, const sock_addr& peer, sock_type t, sock_opt opts = sock_opt::no_reuse_addr|sock_opt::no_delay|sock_opt::blocking)
+            : sockfd(existing_fd), addr(peer), type(t) {
+            if (sockfd < 0) throw socket_error("invalid fd");
+            if (this->sockfd >= 0) {
+                this->set_sock_opts(opts);
+            } else {
+                throw socket_error("cannot set options on invalid socket");
+            }
+
             this->prep_sa();
         }
 #endif
@@ -2089,7 +2115,7 @@ namespace ssock::sock {
 #endif
 #ifdef SSOCK_UNIX
         ~sync_sock() override {
-            if (!this->sockfd) {
+            if (this->sockfd == -1) {
                 return;
             }
             if (internal_net::sys_net_close(this->sockfd) < 0) {
@@ -2228,16 +2254,16 @@ namespace ssock::sock {
             sockaddr_storage client_addr{};
             socklen_t addr_len = sizeof(client_addr);
 
-            int client_sockfd = internal_net::sys_net_accept(this->sockfd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+            int client_sockfd = internal_net::sys_net_accept(this->sockfd,
+                                                             reinterpret_cast<sockaddr*>(&client_addr),
+                                                             &addr_len);
             if (client_sockfd < 0) {
                 throw socket_error("failed to accept connection: " + std::string(strerror(errno)));
             }
 
             auto peer = sock::get_peer(client_sockfd);
-            auto handle = std::make_unique<sync_sock>(peer, this->type);
-            handle->sockfd = client_sockfd;
 
-            return handle;
+            return std::make_unique<sync_sock>(client_sockfd, peer, this->type);
         }
 #endif
 #ifdef SSOCK_WINDOWS
@@ -2535,7 +2561,7 @@ namespace ssock::sock {
          */
 #ifdef SSOCK_UNIX
         void close() override {
-            if (!this->sockfd) {
+            if (this->sockfd == -1) {
                 return;
             }
             if (internal_net::sys_net_close(this->sockfd) < 0) {
@@ -4498,6 +4524,7 @@ namespace ssock::http {
          */
         template <typename T = request_handler<>>
         class sync_server {
+            bool running = true;
             server_settings settings;
             std::function<response(const request&)> callback;
             std::unique_ptr<sock::sync_sock> sock;
@@ -4533,15 +4560,41 @@ namespace ssock::http {
              * @param  handler The handler to use for processing the request
              */
             void accept(const T& handler) {
-                auto client_sock = sock->accept();
+                auto client_sock = this->accept();
                 handler.handle(client_sock, settings, callback);
             }
             /**
-             * @brief  Run the server and attempt to accept an incoming connection
-             * @note Call this function in a loop to keep the server running.
+             * @brief  Accept a connection and return the socket for manual handling
+             * @return The accepted socket
              */
-            void accept() {
-                this->accept(T{});
+            std::unique_ptr<sock::sync_sock> accept() {
+                return sock->accept();
+            }
+            /**
+             * @brief  Run the server
+             */
+            void run() {
+                while (running) {
+                    auto client_sock = sock->accept();
+
+                    std::thread([client_sock = std::move(client_sock),
+                                 settings = this->settings,
+                                 callback = this->callback]() mutable {
+                        try {
+                            T handler{};
+                            handler.handle(client_sock, settings, callback);
+                        } catch (const std::exception& e) {
+                            throw socket_error(e.what());
+                        }
+                    }).detach();
+                }
+            }
+            /**
+             * @brief  Stop the server
+             */
+            void stop() {
+                running = false;
+                sock->close();
             }
         };
     }
