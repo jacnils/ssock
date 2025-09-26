@@ -21,6 +21,7 @@
 #include <random>
 #include <filesystem>
 #include <thread>
+#include <iterator>
 
 #ifndef SSOCK
 #define SSOCK 1
@@ -4553,22 +4554,6 @@ namespace ssock::http {
             };
             ~sync_server() {
                 sock->close();
-            }
-
-            /**
-             * @brief  Accept a connection and handle the request using the provided handler
-             * @param  handler The handler to use for processing the request
-             */
-            void accept(const T& handler) {
-                auto client_sock = this->accept();
-                handler.handle(client_sock, settings, callback);
-            }
-            /**
-             * @brief  Accept a connection and return the socket for manual handling
-             * @return The accepted socket
-             */
-            std::unique_ptr<sock::sync_sock> accept() {
-                return sock->accept();
             }
             /**
              * @brief  Run the server

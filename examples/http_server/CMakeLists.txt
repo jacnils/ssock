@@ -16,6 +16,4 @@ add_executable(
 )
 target_link_libraries(ssock-example PRIVATE
         resolv
-        "-framework SystemConfiguration"
-        "-framework CoreFoundation"
 )

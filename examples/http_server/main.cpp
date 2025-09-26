@@ -1,8 +1,8 @@
 #include <iostream>
 #include <ssock.hpp>
 
-[[noreturn]] int main() {
-    constexpr int port = 8080;
+int main() {
+    constexpr int port = 8081;
     std::cout << "Starting HTTP server on port " << port << "...\n";
     ssock::http::server::sync_server server(
         ssock::http::server::server_settings{
@@ -29,7 +29,8 @@
 
     std::cout << "Server started on port 8080" << ".\n"
               << "Press Ctrl+C to stop the server.\n";
-    while (true) {
-        server.accept();
-    }
+
+    server.run();
+
+    return 0;
 }
