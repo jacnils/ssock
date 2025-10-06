@@ -67,7 +67,7 @@ void test_http_abstr() {
     response_file.close();
 }
 
-[[noreturn]] void test_http_abstr_2() {
+void test_http_abstr_2() {
     ssock::http::server::sync_server server(ssock::http::server::server_settings{
         .port = 8080,
         .enable_session = true,
@@ -89,9 +89,7 @@ void test_http_abstr() {
         return res;
     });
 
-    while (true) {
-        server.accept();
-    }
+    server.run();
 }
 
 void test_get_dns_nameservers(const std::string& hostname) {

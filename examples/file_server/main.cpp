@@ -103,7 +103,5 @@ std::string current_directory{"/"};
             return response;
         });
 
-    while (true) {
-        server.accept();
-    }
+    server.run();
 }
