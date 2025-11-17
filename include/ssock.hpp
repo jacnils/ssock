@@ -2467,7 +2467,7 @@ namespace ssock::sock {
                 auto elapsed = std::chrono::steady_clock::now() - start;
                 auto remaining = std::chrono::seconds(timeout_seconds) - elapsed;
                 if (timeout_seconds == -1) {
-                    remaining = std::chrono::seconds::max();
+                    remaining = std::chrono::hours(24 * 365 * 100);
                 }
                 if (remaining <= std::chrono::seconds(0) && timeout_seconds != -1) {
                     return {data, sock_recv_status::timeout};
