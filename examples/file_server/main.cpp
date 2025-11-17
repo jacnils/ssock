@@ -40,7 +40,7 @@ std::vector<Entry> get_entries_in_directory(const std::string& directory) {
 std::string root_directory{"/"};
 std::string current_directory{"/"};
 
-[[noreturn]] int main() {
+int main() {
     ssock::http::server::sync_server server(
         ssock::http::server::server_settings{
             .port = 1337,
@@ -74,6 +74,7 @@ std::string current_directory{"/"};
                 }
             } else if (request.endpoint != "/" && request.endpoint.at(0) == '/') {
                 auto fod = root_directory + request.endpoint.substr(1);
+                fod = ssock::utility::url_decode(fod);
 
                 if (std::filesystem::is_directory(fod)) {
                     current_directory = fod;
