@@ -1895,7 +1895,11 @@ namespace ssock::sock {
     class sync_sock : basic_sync_sock {
         sock_addr addr;
         sock_type type{};
+#ifdef SSOCK_WINDOWS
+        sock_fd_t sockfd{INVALID_SOCKET};
+#else
         sock_fd_t sockfd{-1};
+#endif
         sockaddr_storage sa_storage{};
         bool bound{false};
         mutable std::string old_bytes;
