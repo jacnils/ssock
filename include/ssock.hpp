@@ -1647,7 +1647,7 @@ namespace ssock::sock {
      * @note This is a typedef for int, but can be changed to a different type if needed.
      */
 #ifdef SSOCK_WINDOWS
-    using sock_fd_t = unsigned long long;
+    using sock_fd_t = SOCKET;
 #elifdef SSOCK_UNIX
     using sock_fd_t = int;
 #endif
