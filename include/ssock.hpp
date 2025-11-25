@@ -1890,7 +1890,7 @@ namespace ssock::sock {
     /**
      * @brief A class that represents a synchronous socket.
      */
-    class sync_sock : basic_sync_sock {
+    class sync_sock : public basic_sync_sock {
         sock_addr addr;
         sock_type type{};
 #ifdef SSOCK_WINDOWS
@@ -3137,7 +3137,7 @@ namespace ssock::network::dns {
         virtual void store(const std::string& hostname, const std::vector<network::dns::dns_record>& records) = 0;
     };
 
-    class standard_dns_cache : basic_dns_cache {
+    class standard_dns_cache : public basic_dns_cache {
     public:
         [[nodiscard]] std::vector<network::dns::dns_record> lookup(const std::string& hostname) const override {
             std::ifstream is(utility::get_standard_cache_location(), std::ios::binary);
@@ -3242,7 +3242,7 @@ namespace ssock::network::dns {
     };
 
     template <typename T = standard_dns_cache>
-    class sync_dns_resolver : basic_sync_dns_resolver<T> {
+    class sync_dns_resolver : public basic_sync_dns_resolver<T> {
         dns_nameserver_list list{};
 
         void throw_if_invalid() const {
@@ -4079,7 +4079,7 @@ namespace ssock::http {
         };
 
         template <typename S = server_settings>
-        class request_handler : basic_request_handler<> {
+        class request_handler : public basic_request_handler<> {
             static std::vector<cookie> get_cookies_from_request(const std::string& cookie_header) {
                 std::vector<cookie> cookies;
                 std::string cookie_str = cookie_header + ";";
@@ -4514,7 +4514,7 @@ namespace ssock::http {
          * @brief  Class that represents a server.
          */
         template <typename T = request_handler<>>
-        class sync_server : basic_sync_server<> {
+        class sync_server : public basic_sync_server<> {
             bool running = true;
             server_settings settings;
             std::function<response(const request&)> callback;
