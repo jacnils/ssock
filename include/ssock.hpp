@@ -509,17 +509,14 @@ namespace ssock::utility {
         std::filesystem::path base_path;
 
 #ifdef SSOCK_WINDOWS
-        char* appdata = nullptr;
-        size_t len = 0;
-        _dupenv_s(&appdata, &len, "LOCALAPPDATA");
-        if (appdata && *appdata) {
-            base_path = appdata;
-            free(appdata);
-        } else {
-            base_path = std::filesystem::temp_directory_path();
-        }
-        base_path /= folder_name;
-
+    	char appdata[MAX_PATH];
+    	DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", appdata, sizeof(appdata));
+    	if (len > 0) {
+    		base_path = appdata;
+    	} else {
+    		base_path = std::filesystem::temp_directory_path();
+    	}
+    	base_path /= folder_name;
 #elifdef SSOCK_MACOS
         if (const char* home = std::getenv("HOME")) {
             base_path = std::filesystem::path(home) / "Library" / "Caches" / folder_name;
@@ -2862,6 +2859,11 @@ namespace ssock::network::dns {
                 dns = dns->Next;
             }
         }
+
+    	dns_nameserver_list list;
+    	list.ipv4 = ipv4_addrs;
+    	list.ipv6 = ipv6_addrs;
+    	return list;
     }
 #endif
     class dns_query_builder {
