@@ -1868,9 +1868,7 @@ namespace ssock::sock {
      */
     class basic_sync_sock {
       public:
-        basic_sync_sock() = default;
         virtual ~basic_sync_sock() = default;
-        basic_sync_sock(const basic_sync_sock&) = delete;
 
         virtual void connect() = 0;
         virtual void bind() = 0;
@@ -3134,7 +3132,6 @@ namespace ssock::network::dns {
 
     class basic_dns_cache {
     public:
-        basic_dns_cache() = default;
         virtual ~basic_dns_cache() = default;
         [[nodiscard]] virtual std::vector<network::dns::dns_record> lookup(const std::string& hostname) const = 0;
         virtual void store(const std::string& hostname, const std::vector<network::dns::dns_record>& records) = 0;
@@ -3241,8 +3238,6 @@ namespace ssock::network::dns {
     class basic_sync_dns_resolver {
     public:
         [[nodiscard]] virtual std::vector<network::dns::dns_record> query_records(const std::string& hostname, network::dns::dns_record_type type) const = 0;
-        explicit basic_sync_dns_resolver() = default;
-        explicit basic_sync_dns_resolver(const dns_nameserver_list&) {};
         virtual ~basic_sync_dns_resolver() = default;
     };
 
@@ -3579,23 +3574,6 @@ namespace ssock::http {
         std::vector<std::pair<std::string, std::string>> headers{};
     };
 
-    template <typename T = std::istringstream, typename R = response, typename VPS = std::vector<std::pair<T,T>>>
-    class basic_body_parser {
-        T& input;
-        R ret{};
-        VPS headers{};
-        T body{};
-    public:
-        explicit basic_body_parser(T& input) : input(input), ret({}) {}
-        explicit basic_body_parser() = default;
-        virtual ~basic_body_parser() = default;
-        virtual VPS& get_headers() = 0;
-        virtual T& get_body() = 0;
-        virtual T& get_input() = 0;
-        virtual http_status_line get_status_line() = 0;
-        virtual R& parse() = 0;
-    };
-
     /**
      * @brief Basic HTTP body parser.
      * @note Splits the body into headers and body.
@@ -3603,8 +3581,8 @@ namespace ssock::http {
     template <typename T = std::istringstream,
               typename R = response,
               typename VPS = std::vector<std::pair<T,T>>>
-    class body_parser : basic_body_parser<T, R> {
-        T& input;
+    class body_parser {
+        const T& input;
         R ret{};
         VPS headers{};
         T body{};
@@ -3614,7 +3592,7 @@ namespace ssock::http {
          * @brief Constructs a basic_body_parser object.
          * @param input The body to parse.
          */
-        explicit body_parser(T& input) : basic_body_parser<T,R,VPS>(input), input(input), ret({}) {
+        explicit body_parser(const T& input) : input(input), ret({}) {
             constexpr auto HEADER_END = "\r\n\r\n";
             const auto pos = input.find(HEADER_END);
             if (pos == std::string::npos) {
@@ -3645,12 +3623,12 @@ namespace ssock::http {
                 }
             }
         }
-        ~body_parser() override = default;
+        ~body_parser() = default;
         /**
          * @brief Parse the status line from the input.
          * @return The parsed http_status_line object.
          */
-        http_status_line get_status_line() override {
+        http_status_line get_status_line() {
             size_t newline_pos = input.find('\n');
             std::string line = (newline_pos != std::string::npos) ? input.substr(0, newline_pos) : input;
 
@@ -3686,27 +3664,27 @@ namespace ssock::http {
          * @brief Get the input stream.
          * @return The input stream (reference)
          */
-        [[nodiscard]] T& get_input() override {
+        [[nodiscard]] T& get_input() {
             return this->input;
         }
         /**
          * @brief Get the body (excluding any headers)
          */
-        [[nodiscard]] T& get_body() override {
+        [[nodiscard]] T& get_body() {
             return this->body;
         }
         /**
          * @brief Get the headers.
          * @return The headers (reference)
          */
-        [[nodiscard]] VPS& get_headers() override {
+        [[nodiscard]] VPS& get_headers() {
             return this->headers;
         }
         /**
          * @brief Parse the body.
          * @return The parsed response (reference)
          */
-        [[nodiscard]] R& parse() override {
+        [[nodiscard]] R& parse() {
             this->ret = R{};
             this->ret.status_line = get_status_line();
             this->ret.headers = get_headers();
@@ -3983,7 +3961,7 @@ namespace ssock::http {
          * @brief Get the response from the server.
          * @return response object, parsed.
          */
-        template <typename T = body_parser<std::string>>
+        template <typename BP = body_parser<std::string>>
         [[nodiscard]] response get() const {
             std::string body{};
             body += this->method_str + " " + this->path + " " + this->version_str + "\r\n";
@@ -4003,9 +3981,7 @@ namespace ssock::http {
 
             auto ret = this->make_request(body);
 
-            T parser(ret);
-
-            return parser.parse();
+            return BP(ret).parse();
         }
     };
 
@@ -4098,7 +4074,6 @@ namespace ssock::http {
         template <typename S = server_settings>
         class basic_request_handler {
         public:
-            basic_request_handler() = default;
             virtual void handle(std::unique_ptr<sock::sync_sock>&, server_settings&, const request_callback&) const = 0;
             virtual ~basic_request_handler() = default;
         };
@@ -4525,10 +4500,21 @@ namespace ssock::http {
         };
 
         /**
+         * @brief  Interface class that represents a server.
+         */
+        template <typename T = request_handler<>>
+        class basic_sync_server {
+            public:
+                virtual ~basic_sync_server() = default;
+                virtual void run() = 0;
+                virtual void stop() = 0;
+        };
+
+        /**
          * @brief  Class that represents a server.
          */
         template <typename T = request_handler<>>
-        class sync_server {
+        class sync_server : basic_sync_server<> {
             bool running = true;
             server_settings settings;
             std::function<response(const request&)> callback;
@@ -4562,7 +4548,7 @@ namespace ssock::http {
             /**
              * @brief  Run the server
              */
-            void run() {
+            void run() override {
                 while (running) {
                     auto client_sock = sock->accept();
 
@@ -4581,7 +4567,7 @@ namespace ssock::http {
             /**
              * @brief  Stop the server
              */
-            void stop() {
+            void stop() override {
                 running = false;
                 sock->close();
             }

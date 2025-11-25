@@ -1,3 +1,3 @@
 # Reporting a Vulnerability
 
-Please report vulnerabilities to us through email. You can email us at `contact@jacobnilsson.com`.
+Please report vulnerabilities to me through email. You can email me at `contact@jacobnilsson.com`.
