@@ -7,21 +7,22 @@
  */
 #pragma once
 
+#include <algorithm>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
+#include <random>
+#include <ranges>
 #include <sstream>
 #include <string>
-#include <utility>
-#include <vector>
-#include <cstring>
-#include <unordered_map>
-#include <variant>
-#include <algorithm>
-#include <ranges>
-#include <functional>
-#include <random>
-#include <filesystem>
 #include <thread>
-#include <iterator>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #ifndef SSOCK
 #define SSOCK 1
@@ -1914,35 +1915,49 @@ namespace ssock::sock {
             throw socket_error("invalid address type");
         }
 
-        void prep_sa() {
-            memset(&sa_storage, 0, sizeof(sa_storage));
-            if (addr.is_ipv4()) {
-                auto* sa4 = reinterpret_cast<sockaddr_in*>(&sa_storage);
-                sa4->sin_family = AF_INET;
-                sa4->sin_port = htons(addr.get_port());
-                if (inet_pton(AF_INET, addr.get_ip().c_str(), &sa4->sin_addr) <= 0) {
-                    throw parsing_error("invalid IPv4 address");
-                }
-            } else if (addr.is_ipv6()) {
-                auto* sa6 = reinterpret_cast<sockaddr_in6*>(&sa_storage);
-                sa6->sin6_family = AF_INET6;
-                sa6->sin6_port = htons(addr.get_port());
-                if (inet_pton(AF_INET6, addr.get_ip().c_str(), &sa6->sin6_addr) <= 0) {
-                    throw parsing_error("invalid IPv6 address");
-                }
-            } else if (addr.is_file_path()) {
-                auto* sa_un = reinterpret_cast<sockaddr_un*>(&sa_storage);
-                sa_un->sun_family = AF_UNIX;
-                const auto& path = addr.get_path().string();
-                if (path.size() >= sizeof(sa_un->sun_path)) {
-                    throw socket_error("UNIX socket path too long");
-                }
-                std::memcpy(sa_un->sun_path, path.c_str(), path.size() + 1);
-            } else {
-                throw ip_error("invalid address type");
-            }
-        }
+    	void prep_sa() {
+        	memset(&sa_storage, 0, sizeof(sa_storage));
 
+        	if (addr.is_ipv4()) {
+        		auto* sa4 = reinterpret_cast<sockaddr_in*>(&sa_storage);
+        		sa4->sin_family = AF_INET;
+        		sa4->sin_port = htons(addr.get_port());
+        		if (inet_pton(AF_INET, addr.get_ip().c_str(), &sa4->sin_addr) <= 0) {
+        			throw parsing_error("invalid IPv4 address");
+        		}
+        	} else if (addr.is_ipv6()) {
+        		auto* sa6 = reinterpret_cast<sockaddr_in6*>(&sa_storage);
+        		sa6->sin6_family = AF_INET6;
+        		sa6->sin6_port = htons(addr.get_port());
+
+        		std::string ip = addr.get_ip();
+        		unsigned long scope = 0;
+
+        		auto pos = ip.find('%');
+        		if (pos != std::string::npos) {
+        			scope = std::stoul(ip.substr(pos + 1));
+        			ip = ip.substr(0, pos);   // strip %scope before inet_pton
+        		}
+
+        		if (inet_pton(AF_INET6, ip.c_str(), &sa6->sin6_addr) <= 0) {
+        			throw parsing_error("invalid IPv6 address");
+        		}
+
+        		if (scope != 0) {
+        			sa6->sin6_scope_id = scope;
+        		}
+        	} else if (addr.is_file_path()) {
+        		auto* sa_un = reinterpret_cast<sockaddr_un*>(&sa_storage);
+        		sa_un->sun_family = AF_UNIX;
+        		const auto& path = addr.get_path().string();
+        		if (path.size() >= sizeof(sa_un->sun_path)) {
+        			throw socket_error("UNIX socket path too long");
+        		}
+        		std::memcpy(sa_un->sun_path, path.c_str(), path.size() + 1);
+        	} else {
+        		throw ip_error("invalid address type");
+        	}
+        }
 #ifdef SSOCK_UNIX
         void set_sock_opts(sock_opt opts) const {
             if (opts & sock_opt::reuse_addr) {
@@ -1982,7 +1997,7 @@ namespace ssock::sock {
         }
 #endif
 #ifdef SSOCK_WINDOWS
-        void set_sock_opts(sock_opt opts) {
+        void set_sock_opts(sock_opt opts) const {
             if (opts & sock_opt::reuse_addr) {
                 BOOL optval = TRUE;
                 if (setsockopt(this->sockfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
@@ -1996,7 +2011,7 @@ namespace ssock::sock {
                     throw socket_error("failed to clear SO_REUSEADDR");
                 }
             }
-            if (opts & sock_opt::no_delay) {
+        	if ((opts & sock_opt::no_delay) && type == sock_type::tcp) {
                 BOOL optval = TRUE;
                 if (setsockopt(this->sockfd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&optval), sizeof(optval)) == SOCKET_ERROR) {
                     closesocket(this->sockfd);
@@ -2810,61 +2825,95 @@ namespace ssock::network::dns {
     }
 #endif
 #ifdef SSOCK_WINDOWS
-    [[nodiscard]] inline dns_nameserver_list get_nameservers() {
-        std::vector<std::string> ipv4_addrs;
-        std::vector<std::string> ipv6_addrs;
+	[[nodiscard]] inline dns_nameserver_list get_nameservers() {
+		std::vector<std::string> ipv4_addrs;
+		std::vector<std::string> ipv6_addrs;
 
-        ULONG bufsiz = 0;
-        DWORD result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &bufsiz);
-        if (result != ERROR_BUFFER_OVERFLOW) {
-            throw parsing_error("failed to get adapter buffer size");
-        }
+		ULONG bufsiz = 0;
+		DWORD result = GetAdaptersAddresses(
+			AF_UNSPEC,
+	        GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_ANYCAST |
+		    GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_FRIENDLY_NAME,
+			nullptr,
+			nullptr,
+			&bufsiz
+		);
 
-        std::vector<char> buffer(bufsiz);
-        IP_ADAPTER_ADDRESSES* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+		if (result != ERROR_BUFFER_OVERFLOW) {
+			throw parsing_error("failed to get adapter buffer size");
+		}
 
-        result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &bufsiz);
-        if (result != NO_ERROR) {
-            throw parsing_error("GetAdaptersAddresses failed");
-        }
+		std::vector<char> buffer(bufsiz);
+		auto* adapters =
+			reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
 
-        for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
-            IP_ADAPTER_DNS_SERVER_ADDRESS* dns = adapter->FirstDnsServerAddress;
-            while (dns) {
-                char ipstr[INET6_ADDRSTRLEN] = {};
-                sockaddr* sa = dns->Address.lpSockaddr;
+		result = GetAdaptersAddresses(
+			AF_UNSPEC,
+			GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_ANYCAST |
+			GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_FRIENDLY_NAME,
+			nullptr,
+			adapters,
+			&bufsiz
+		);
 
-                if (sa->sa_family == AF_INET) {
-                    auto sin = reinterpret_cast<sockaddr_in*>(sa);
-                    inet_ntop(AF_INET, &sin->sin_addr, ipstr, sizeof(ipstr));
+		if (result != NO_ERROR) {
+			throw parsing_error("GetAdaptersAddresses failed");
+		}
 
-                    if (!is_ipv4(ipstr)) {
-                        dns = dns->Next;
-                        continue;
-                    }
+		std::unordered_set<std::string> seen;
 
-                    ipv4_addrs.emplace_back(ipstr);
-                } else if (sa->sa_family == AF_INET6) {
-                    auto sin6 = reinterpret_cast<sockaddr_in6*>(sa);
-                    inet_ntop(AF_INET6, &sin6->sin6_addr, ipstr, sizeof(ipstr));
+		for (auto* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
+			if (adapter->OperStatus != IfOperStatusUp)
+				continue;
 
-                    if (!is_ipv6(ipstr)) {
-                        dns = dns->Next;
-                        continue;
-                    }
+			if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+				continue;
 
-                    ipv6_addrs.emplace_back(ipstr);
-                }
+			switch (adapter->IfType) {
+				case IF_TYPE_TUNNEL:
+				case IF_TYPE_PROP_VIRTUAL:
+					continue;
+			}
 
-                dns = dns->Next;
-            }
-        }
+			for (auto* dns = adapter->FirstDnsServerAddress; dns; dns = dns->Next) {
+				sockaddr* sa = dns->Address.lpSockaddr;
 
-    	dns_nameserver_list list;
-    	list.ipv4 = ipv4_addrs;
-    	list.ipv6 = ipv6_addrs;
-    	return list;
-    }
+				char ipstr[INET6_ADDRSTRLEN] = {};
+
+				if (sa->sa_family == AF_INET) {
+					auto* sin = reinterpret_cast<sockaddr_in*>(sa);
+					inet_ntop(AF_INET, &sin->sin_addr, ipstr, sizeof(ipstr));
+
+					if (!is_ipv4(ipstr))
+						continue;
+
+					std::string ip(ipstr);
+					if (!seen.insert(ip).second) continue;
+					ipv4_addrs.emplace_back(std::move(ip));
+				} else if (sa->sa_family == AF_INET6) {
+					auto* sin6 = reinterpret_cast<sockaddr_in6*>(sa);
+					inet_ntop(AF_INET6, &sin6->sin6_addr, ipstr, sizeof(ipstr));
+
+					if (!is_ipv6(ipstr))
+						continue;
+
+					std::string ip(ipstr);
+
+					if (sin6->sin6_scope_id != 0) {
+						ip += "%" + std::to_string(sin6->sin6_scope_id);
+					}
+
+					if (!seen.insert(ip).second) continue;
+					ipv6_addrs.emplace_back(std::move(ip));
+				}
+			}
+		}
+
+		dns_nameserver_list list;
+		list.ipv4 = std::move(ipv4_addrs);
+		list.ipv6 = std::move(ipv6_addrs);
+		return list;
+	}
 #endif
     class dns_query_builder {
         std::vector<uint8_t> packet;
@@ -3261,137 +3310,154 @@ namespace ssock::network::dns {
             throw_if_invalid();
         }
 
-        [[nodiscard]] std::vector<network::dns::dns_record> query_records(const std::string& hostname, network::dns::dns_record_type type) const override {
-            throw_if_invalid();
+        [[nodiscard]] std::vector<network::dns::dns_record> query_records(const std::string& hostname, dns_record_type type) const override {
+		    throw_if_invalid();
 
-            T cache{};
-            auto cached_records = cache.lookup(hostname);
+			T cache{};
+			auto cached_records = cache.lookup(hostname);
 
-            std::vector<network::dns::dns_record> valid_cached_records;
-            auto now = std::chrono::system_clock::now();
+			const auto now = std::chrono::system_clock::now();
+			std::vector<network::dns::dns_record> valid_cached;
 
-            for (const auto& record : cached_records) {
-                if (record.type != type) continue;
+			for (const auto& r : cached_records) {
+				if (r.type != type) continue;
 
-                auto created_time = std::chrono::system_clock::time_point(std::chrono::milliseconds(record.created_at));
-                auto expiry_time = created_time + std::chrono::seconds(record.ttl);
+				auto created = std::chrono::system_clock::time_point(
+				std::chrono::milliseconds(r.created_at));
+				auto expires = created + std::chrono::seconds(r.ttl);
 
-                if (expiry_time < now) {
-                    continue; // expired
-                }
+				if (expires > now) valid_cached.push_back(r);
+			}
 
-                valid_cached_records.push_back(record);
-            }
+			if (!valid_cached.empty())
+				return valid_cached;
 
-            if (!valid_cached_records.empty()) {
-                return valid_cached_records;
-            }
 
-            dns_query_builder query_builder;
-            query_builder.add_question(hostname, type);
-            std::vector<unsigned char> query = query_builder.build();
+			dns_query_builder builder;
+			builder.add_question(hostname, type);
 
-            bool successful = false;
-            std::vector<network::dns::dns_record> all_records;
+			std::vector<uint8_t> query = builder.build();
 
-            auto try_query_on_server = [&](const std::string& server, ssock::sock::sock_addr_type addr_type) -> bool {
-                auto send_and_parse = [&](ssock::sock::sock_type s_type) -> bool {
-                    ssock::sock::sock_addr addr{server, 53, addr_type};
-                    ssock::sock::sync_sock sock(addr, s_type, ssock::sock::sock_opt::blocking | ssock::sock::sock_opt::no_delay);
+			std::vector<network::dns::dns_record> all_records;
 
-                    sock.connect();
+			auto send_udp = [&](const std::string& server, ssock::sock::sock_addr_type family) -> std::optional<std::vector<uint8_t>> {
+				ssock::sock::sock_addr addr(server, 53, family);
+				ssock::sock::sync_sock sock(
+					addr,
+					ssock::sock::sock_type::udp,
+					ssock::sock::sock_opt::blocking |
+					ssock::sock::sock_opt::no_delay
+				);
 
-                    if (s_type == ssock::sock::sock_type::tcp) {
-                        uint16_t len = htons(static_cast<uint16_t>(query.size()));
-                        sock.send(reinterpret_cast<const char*>(&len), 2);
-                    }
+				sock.connect();
 
-                    sock.send(reinterpret_cast<const char*>(query.data()), query.size());
+		        sock.send((char*)query.data(), query.size());
 
-                    std::string response{};
-                    if (s_type == ssock::sock::sock_type::udp) {
-                        response = sock.recv(5, 512).data;
-                    } else {
-                        std::string len_buf;
-                        while (len_buf.size() < 2) {
-                            std::string chunk = sock.recv(2, 2 - len_buf.size()).data;
-                            if (chunk.empty()) {
-                                return false;
-                            }
-                            len_buf += chunk;
-                        }
+				auto resp = sock.recv(2, 4096).data;
 
-                        uint16_t resp_len = ntohs(*reinterpret_cast<const uint16_t*>(len_buf.data()));
+				if (resp.size() < 12)
+					return std::nullopt;
 
-                        response.reserve(resp_len);
-                        size_t total_received = 0;
-                        while (total_received < resp_len) {
-                            size_t to_read = resp_len - total_received;
-                            std::string chunk = sock.recv(5, to_read).data;
-                            if (chunk.empty()) {
-                                return false;
-                            }
-                            total_received += chunk.size();
-                            response += chunk;
-                        }
-                    }
+				bool truncated = (resp[2] & 0x02) != 0;
+				if (truncated)
+					return std::nullopt;
 
-                    if (response.size() < 12) return false;
+				return std::vector<uint8_t>(resp.begin(), resp.end());
+			};
 
-                    std::vector<uint8_t> response_bytes(response.begin(), response.end());
-                    if (s_type == ssock::sock::sock_type::udp && (response_bytes[2] & 0x02)) {
-                        return false;
-                    }
 
-                    dns_response_parser parser(response_bytes);
-                    auto records = parser.parse();
+			auto send_tcp = [&](const std::string& server, ssock::sock::sock_addr_type family) -> std::optional<std::vector<uint8_t>> {
+				ssock::sock::sock_addr addr(server, 53, family);
+				ssock::sock::sync_sock sock(
+					addr,
+					ssock::sock::sock_type::tcp,
+					ssock::sock::sock_opt::blocking |
+					ssock::sock::sock_opt::no_delay
+				);
+				sock.connect();
 
-                    all_records.insert(all_records.end(), records.begin(), records.end());
+				uint16_t len = htons((uint16_t)query.size());
+				sock.send((char*)&len, 2);
+				sock.send((char*)query.data(), query.size());
 
-                    return true;
-                };
+				std::string lenbuf;
+				while (lenbuf.size() < 2) {
+					auto chunk = sock.recv(2, 2 - lenbuf.size()).data;
+					if (chunk.empty())
+						return std::nullopt;
+					lenbuf += chunk;
+				}
 
-                try {
-                    if (send_and_parse(ssock::sock::sock_type::udp)) {
-                        return true;
-                    } else {
-                        return send_and_parse(ssock::sock::sock_type::tcp);
-                    }
-                } catch (...) {
-                    return false;
-                }
-            };
+				uint16_t resp_len = ntohs(*reinterpret_cast<const uint16_t*>(lenbuf.data()));
+				if (resp_len == 0)
+					return std::nullopt;
 
-            if (usable_ipv6_address_exists() && list.contains_ipv6()) {
-                for (const auto& server : list.get_ipv6()) {
-                    if (try_query_on_server(server, ssock::sock::sock_addr_type::ipv6)) {
-                        successful = true;
-                        break;
-                    }
-                }
-            }
+				std::string resp;
+				resp.reserve(resp_len);
 
-            if (!successful && list.contains_ipv4()) {
-                for (const auto& server : list.get_ipv4()) {
-                    if (try_query_on_server(server, ssock::sock::sock_addr_type::ipv4)) {
-                        successful = true;
-                        break;
-                    }
-                }
-            }
+				while (resp.size() < resp_len) {
+					size_t to_read = resp_len - resp.size();
+					auto chunk = sock.recv(2, to_read).data;
+					if (chunk.empty())
+						return std::nullopt;
+					resp += chunk;
+				}
 
-            if (!successful) {
-                throw dns_error("All DNS queries failed.");
-            }
+				return std::vector<uint8_t>(resp.begin(), resp.end());
+			};
 
-            if (all_records.empty()) {
-                throw dns_error("No DNS records found for the hostname: " + hostname);
-            }
+			auto try_server = [&](const std::string& server, ssock::sock::sock_addr_type family) -> bool {
+				auto udp_resp = send_udp(server, family);
+				std::optional<std::vector<uint8_t>> final_resp;
 
-            cache.store(hostname, all_records);
+				if (udp_resp.has_value()) {
+					final_resp = udp_resp;
+				} else {
+					auto tcp_resp = send_tcp(server, family);
+					if (!tcp_resp.has_value())
+						return false;
 
-            return all_records;
-        }
+					final_resp = tcp_resp;
+				}
+
+				dns_response_parser parser(*final_resp);
+				auto recs = parser.parse();
+
+				all_records.insert(all_records.end(), recs.begin(), recs.end());
+
+				return !recs.empty();
+			};
+
+			bool success = false;
+
+			if (usable_ipv6_address_exists() && list.contains_ipv6()) {
+				for (const auto& s : list.get_ipv6()) {
+					if (try_server(s, ssock::sock::sock_addr_type::ipv6)) {
+						success = true;
+						break;
+					}
+				}
+			}
+
+			if (!success && list.contains_ipv4()) {
+				for (const auto& s : list.get_ipv4()) {
+					if (try_server(s, ssock::sock::sock_addr_type::ipv4)) {
+						success = true;
+						break;
+					}
+				}
+			}
+
+			if (!success)
+				throw dns_error("all DNS queries failed.");
+
+			if (all_records.empty())
+				throw dns_error("no DNS records found for: " + hostname);
+
+			cache.store(hostname, all_records);
+
+			return all_records;
+		}
     };
 }
 
@@ -4544,7 +4610,7 @@ namespace ssock::http {
                 }
                 sock->listen(settings.max_connections);
             };
-            ~sync_server() {
+            ~sync_server() override {
                 sock->close();
             }
             /**
