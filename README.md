@@ -38,7 +38,31 @@ cmake --install .
 
 ## Usage
 
-See `examples/` for examples of how to use the library.
+You can use the library by simply copying the header into your project. If you do this, make sure to link with:
+
+- Windows: `ws2_32 iphlpapi dnsapi`
+- Linux: `resolv`
+- macOS: `resolve -framework SystemConfiguration -framework CoreFoundation`
+
+Alternatively, if you choose to install the library, you can use CMake and link with ssock, which will in turn link with the necessary libraries:
+
+```cmake
+...
+
+find_package(ssock)
+
+add_executable(
+        MY_TARGET
+        main.cpp
+)
+target_link_libraries(ssock-example PRIVATE
+	ssock::ssock
+)
+
+...
+```
+
+See `examples/` for further examples of how to use the library.
 
 ## License
 
