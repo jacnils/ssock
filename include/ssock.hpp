@@ -27,13 +27,28 @@
 #ifndef SSOCK
 #define SSOCK 1
 #endif
+#ifndef SSOCK_ENABLE_DEPRECATED
+#define SSOCK_ENABLE_DEPRECATED 0
+#endif
 
+#ifndef SSOCK_FALLBACK_IPV4_DNS_1
 #define SSOCK_FALLBACK_IPV4_DNS_1 "8.8.8.8"
+#endif
+#ifndef SSOCK_FALLBACK_IPV4_DNS_2
 #define SSOCK_FALLBACK_IPV4_DNS_2 "8.8.4.4"
+#endif
+#ifndef SSOCK_FALLBACK_IPV6_DNS_1
 #define SSOCK_FALLBACK_IPV6_DNS_1 "2001:4860:4860::8888"
+#endif
+#ifndef SSOCK_FALLBACK_IPV6_DNS_2
 #define SSOCK_FALLBACK_IPV6_DNS_2 "2001:4860:4860::8844"
+#endif
+#ifndef SSOCK_LOCALHOST_IPV4
 #define SSOCK_LOCALHOST_IPV4 "127.0.0.1"
+#endif
+#ifndef SSOCK_LOCALHOST_IPV6
 #define SSOCK_LOCALHOST_IPV6 "::1"
+#endif
 
 #if defined(__APPLE__)
 #define SSOCK_MACOS
@@ -1092,6 +1107,7 @@ namespace ssock::network {
                    lhs.data == rhs.data;
         }
 
+#if SSOCK_ENABLE_DEPRECATED
         namespace deprecated {
             using dns_selector = std::variant<std::monostate, std::string, dns_record_type>;
             class dns_resolver final {
@@ -1397,7 +1413,8 @@ namespace ssock::network {
                 }
 #endif
             };
-        }
+        } // deprecated end
+#endif
     }
 
     /**
@@ -2497,7 +2514,7 @@ namespace ssock::sock {
 
                 if (this->sockfd < 0) throw socket_error("invalid socket descriptor");
 
-                int ret = ::select(this->sockfd + 1, &readfds, nullptr, nullptr, timeout_seconds == -1 ? nullptr : &tv);
+                int ret = ::select(0, &readfds, nullptr, nullptr, timeout_seconds == -1 ? nullptr : &tv);
                 if (ret == SOCKET_ERROR) {
                     throw socket_error("select() failed");
                 }
@@ -2873,7 +2890,8 @@ namespace ssock::network::dns {
 				case IF_TYPE_TUNNEL:
 				case IF_TYPE_PROP_VIRTUAL:
 					continue;
-			}
+				default:;
+				}
 
 			for (auto* dns = adapter->FirstDnsServerAddress; dns; dns = dns->Next) {
 				sockaddr* sa = dns->Address.lpSockaddr;
@@ -3358,8 +3376,7 @@ namespace ssock::network::dns {
 				if (resp.size() < 12)
 					return std::nullopt;
 
-				bool truncated = (resp[2] & 0x02) != 0;
-				if (truncated)
+				if ((resp[2] & 0x02) != 0)
 					return std::nullopt;
 
 				return std::vector<uint8_t>(resp.begin(), resp.end());
@@ -3376,7 +3393,7 @@ namespace ssock::network::dns {
 				);
 				sock.connect();
 
-				uint16_t len = htons((uint16_t)query.size());
+				uint16_t len = htons(static_cast<uint16_t>(query.size()));
 				sock.send((char*)&len, 2);
 				sock.send((char*)query.data(), query.size());
 
@@ -3766,7 +3783,7 @@ namespace ssock::http {
     /**
      * @brief A class that represents an HTTP client.
      */
-    class client final {
+    class client {
         std::string hostname{};
         std::string path{};
         int port{};
@@ -3786,7 +3803,7 @@ namespace ssock::http {
             sock.send(request);
 
             std::string raw;
-            std::string headers;
+            std::string s_headers;
             while (true) {
                 auto result = sock.recv(this->timeout, "\r\n\r\n", 0); // match headers end, no eof limit
                 if (result.status == sock::sock_recv_status::timeout) {
@@ -3801,7 +3818,7 @@ namespace ssock::http {
 
                 raw += result.data;
                 if (auto pos = raw.find("\r\n\r\n"); pos != std::string::npos) {
-                    headers = raw.substr(0, pos + 4);
+                    s_headers = raw.substr(0, pos + 4);
                     raw = raw.substr(pos + 4);
                     break;
                 }
@@ -3810,7 +3827,7 @@ namespace ssock::http {
             bool is_chunked = false;
             std::size_t content_length = 0;
 
-            std::istringstream header_stream(headers);
+            std::istringstream header_stream(s_headers);
             std::string line;
             while (std::getline(header_stream, line) && line != "\r") {
                 if (line.starts_with("Transfer-Encoding:") && line.find("chunked") != std::string::npos) {
@@ -3820,7 +3837,7 @@ namespace ssock::http {
                 }
             }
 
-            std::string body;
+            std::string s_body;
 
             if (is_chunked) {
                 std::string chunked_data = std::move(raw);
@@ -3829,17 +3846,17 @@ namespace ssock::http {
                     if (chunk.empty()) throw std::runtime_error("connection closed during chunked body");
                     chunked_data += chunk;
                 }
-                body = utility::decode_chunked(chunked_data);
+                s_body = utility::decode_chunked(chunked_data);
             } else {
-                body = std::move(raw);
-                while (body.size() < content_length) {
+                s_body = std::move(raw);
+                while (s_body.size() < content_length) {
                     auto res = sock.recv(30, "", 0);
                     if (res.data.empty()) break;
-                    body += res.data;
+                    s_body += res.data;
                 }
             }
 
-            return headers + body;
+            return s_headers + s_body;
         }
     public:
         /**
@@ -3868,10 +3885,10 @@ namespace ssock::http {
 
         /**
          * @brief Append headers to the request.
-         * @param headers The headers to append.
+         * @param in_headers The headers to append.
          */
-        void append_headers(const std::vector<std::pair<std::string, std::string>>& headers) {
-            for (const auto& [key, value] : headers) {
+        void append_headers(const std::vector<std::pair<std::string, std::string>>& in_headers) {
+            for (const auto& [key, value] : in_headers) {
                 if (key == "Host" || key == "Content-Length") {
                     throw parsing_error("illegal header: " + key);
                 }
@@ -3880,10 +3897,10 @@ namespace ssock::http {
         }
         /**
          * @brief Set the request body.
-         * @param body The body to set.
+         * @param in_body The body to set.
          */
-        void set_body(const std::string& body) {
-            this->body = body;
+        void set_body(const std::string& in_body) {
+            this->body = in_body;
         }
         /**
          * @brief Set a header.
@@ -3970,11 +3987,11 @@ namespace ssock::http {
         }
         /**
          * @brief Set the Connect-Timeout header.
-         * @param timeout The Connect-Timeout value to set.
+         * @param in_timeout The Connect-Timeout value to set.
          * @note Example: 5
          */
-        void set_connect_timeout(int timeout) {
-            this->set_header("Connect-Timeout", std::to_string(timeout));
+        void set_connect_timeout(int in_timeout) {
+            this->set_header("Connect-Timeout", std::to_string(in_timeout));
         }
         /**
          * @brief Get the request headers.
@@ -4031,23 +4048,23 @@ namespace ssock::http {
          */
         template <typename BP = body_parser<std::string>>
         [[nodiscard]] response get() const {
-            std::string body{};
-            body += this->method_str + " " + this->path + " " + this->version_str + "\r\n";
+            std::string in_body{};
+            in_body += this->method_str + " " + this->path + " " + this->version_str + "\r\n";
 
             for (const auto& [key, value] : this->headers) {
-                body += key + ": " += value + "\r\n";
+                in_body += key + ": " += value + "\r\n";
             }
 
-            body += "Host: " + this->hostname + "\r\n";
+            in_body += "Host: " + this->hostname + "\r\n";
 
             if (m == method::POST && !this->body.empty()) {
-                body += "Content-Length: " + std::to_string(this->body.size()) + "\r\n";
-                body += "\r\n" + this->body;
+                in_body += "Content-Length: " + std::to_string(this->body.size()) + "\r\n";
+                in_body += "\r\n" + this->body;
             } else {
-                body += "\r\n";
+                in_body += "\r\n";
             }
 
-            auto ret = this->make_request(body);
+            auto ret = this->make_request(in_body);
 
             return BP(ret).parse();
         }
