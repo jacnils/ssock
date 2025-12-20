@@ -1,5 +1,7 @@
 # ssock
 
+[![CMake on Linux, macOS, and Windows](https://github.com/jacnils/ssock/actions/workflows/cmake-multi-platform.yml/badge.svg)](https://github.com/jacnils/ssock/actions/workflows/cmake-multi-platform.yml)
+
 Simple library providing modernized, safe Unix-style sockets, HTTP abstraction, DNS resolution and more for Windows, macOS, Linux and other systems.
 
 ## Features
@@ -8,6 +10,7 @@ Simple library providing modernized, safe Unix-style sockets, HTTP abstraction, 
 - HTTP/1.0 and HTTP/1.1 body parser, including headers and body.
 - IPv4 and IPv6 support
 - TCP and UDP support
+- OpenSSL integration
 - DNS resolution*
 - Network interface enumeration
 - Exceptions for errors
@@ -16,7 +19,7 @@ Simple library providing modernized, safe Unix-style sockets, HTTP abstraction, 
 - Support for Windows, Linux, macOS and other Unix-compatible systems.
 - No dependencies\*
 
-\*aside from system level dependencies, which are usually already installed on most systems.
+\*aside from system level dependencies, which are usually already installed on most systems, and OpenSSL (if enabled).
 
 Still missing:
 
@@ -41,8 +44,12 @@ cmake --install .
 You can use the library by simply copying the header into your project. If you do this, make sure to link with:
 
 - Windows: `ws2_32 iphlpapi dnsapi`
-- Linux: `resolv`
-- macOS: `resolve -framework SystemConfiguration -framework CoreFoundation`
+- Linux: None.
+- macOS: `-framework SystemConfiguration -framework CoreFoundation`
+
+If OpenSSL is desired, link with `ssl` as well.
+
+If deprecated features are enabled (disabled by default), if on Linux or macOS, link with `resolv` as well. 
 
 Alternatively, if you choose to install the library, you can use CMake and link with ssock, which will in turn link with the necessary libraries:
 
