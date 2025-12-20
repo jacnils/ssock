@@ -127,22 +127,6 @@ namespace ssock::internal_net {
 #error "Unsupported platform. Please file a pull request to add support for your platform."
 #endif
 
-namespace ssock::internal_net {
-#if defined(__unix__) || defined(__unix) || defined(__APPLE__) && defined(__MACH__)
-    static constexpr auto sys_net_gethostbyname = gethostbyname;
-    static constexpr auto sys_net_connect = connect;
-    static constexpr auto sys_net_socket = socket;
-    static constexpr auto sys_net_send = send;
-    static constexpr auto sys_net_recv = recv;
-    static constexpr auto sys_net_close = close;
-    static constexpr auto sys_net_listen = listen;
-    static constexpr auto sys_net_bind = bind;
-    static constexpr auto sys_net_accept = accept;
-    static constexpr auto sys_net_select = select;
-    static constexpr auto sys_net_setsockopt = setsockopt;
-#endif
-}
-
 namespace ssock {
     using exception_type = std::exception;
 
@@ -1640,7 +1624,7 @@ namespace ssock::network {
 
 
 namespace ssock::internal_net {
-    ssock::network::sock_ip_list get_a_aaaa_from_hostname(const std::string& hostname);
+    network::sock_ip_list get_a_aaaa_from_hostname(const std::string& hostname);
 }
 
 /**
@@ -1972,36 +1956,36 @@ namespace ssock::sock {
 #ifdef SSOCK_UNIX
         void set_sock_opts(sock_opt opts) const {
             if (opts & sock_opt::reuse_addr) {
-                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opts, sizeof(opts));
+                ::setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opts, sizeof(opts));
             } else if (opts & sock_opt::no_reuse_addr) {
-                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, nullptr, 0);
+                ::setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, nullptr, 0);
             }
             if (opts & sock_opt::no_delay) {
-                internal_net::sys_net_setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &opts, sizeof(opts));
+                ::setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &opts, sizeof(opts));
             }
             if (opts & sock_opt::keep_alive) {
-                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &opts, sizeof(opts));
+                ::setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &opts, sizeof(opts));
             } else if (opts & sock_opt::no_keep_alive) {
-                internal_net::sys_net_setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, nullptr, 0);
+                ::setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, nullptr, 0);
             }
             if (opts & sock_opt::no_blocking) {
                 int flags = fcntl(this->sockfd, F_GETFL, 0);
                 if (flags < 0) {
-                    internal_net::sys_net_close(this->sockfd);
+                    ::close(this->sockfd);
                     throw socket_error("failed to get socket flags");
                 }
                 if (fcntl(this->sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-                    internal_net::sys_net_close(this->sockfd);
+                    ::close(this->sockfd);
                     throw socket_error("failed to set socket to non-blocking mode");
                 }
             } else if (opts & sock_opt::blocking) {
                 int flags = fcntl(this->sockfd, F_GETFL, 0);
                 if (flags < 0) {
-                    internal_net::sys_net_close(this->sockfd);
+                    ::close(this->sockfd);
                     throw socket_error("failed to get socket flags");
                 }
                 if (fcntl(this->sockfd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
-                    internal_net::sys_net_close(this->sockfd);
+                    ::close(this->sockfd);
                     throw socket_error("failed to set socket to blocking mode");
                 }
             }
@@ -2073,10 +2057,10 @@ namespace ssock::sock {
             }
 
             if (t != sock_type::unix) {
-                this->sockfd = internal_net::sys_net_socket(addr.is_ipv6() ? AF_INET6 : AF_INET,
+                this->sockfd = ::socket(addr.is_ipv6() ? AF_INET6 : AF_INET,
                                                                   t == sock_type::tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
             } else {
-                this->sockfd = internal_net::sys_net_socket(AF_UNIX, SOCK_STREAM, 0);
+                this->sockfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
             }
 
             if (this->sockfd < 0) {
@@ -2144,7 +2128,7 @@ namespace ssock::sock {
             if (this->sockfd == -1) {
                 return;
             }
-            if (internal_net::sys_net_close(this->sockfd) < 0) {
+            if (::close(this->sockfd) < 0) {
                 ;
             }
         }
@@ -2181,7 +2165,7 @@ namespace ssock::sock {
          */
 #ifdef SSOCK_UNIX
         void connect() override {
-            if (internal_net::sys_net_connect(this->sockfd, this->get_sa(), this->get_sa_len()) < 0) {
+            if (::connect(this->sockfd, this->get_sa(), this->get_sa_len()) < 0) {
                 throw socket_error("failed to connect to server");
             }
         }
@@ -2200,7 +2184,7 @@ namespace ssock::sock {
         void bind() override {
             this->bound = true;
 
-            auto ret = internal_net::sys_net_bind(this->sockfd, this->get_sa(), this->get_sa_len());
+            auto ret = ::bind(this->sockfd, this->get_sa(), this->get_sa_len());
 
             if (ret < 0) {
                 throw socket_error("failed to bind socket: " + std::to_string(ret));
@@ -2225,7 +2209,7 @@ namespace ssock::sock {
 #ifdef SSOCK_UNIX
         void unbind() override {
             if (this->bound) {
-                if (internal_net::sys_net_close(this->sockfd) < 0) {
+                if (::close(this->sockfd) < 0) {
                     throw socket_error("failed to unbind socket");
                 }
                 this->bound = false;
@@ -2251,7 +2235,7 @@ namespace ssock::sock {
          */
 #ifdef SSOCK_UNIX
         void listen(int backlog) override {
-            if (internal_net::sys_net_listen(this->sockfd, backlog == -1 ? SOMAXCONN : backlog) < 0) {
+            if (::listen(this->sockfd, backlog == -1 ? SOMAXCONN : backlog) < 0) {
                 throw socket_error("failed to listen on socket");
             }
         }
@@ -2280,7 +2264,7 @@ namespace ssock::sock {
             sockaddr_storage client_addr{};
             socklen_t addr_len = sizeof(client_addr);
 
-            int client_sockfd = internal_net::sys_net_accept(this->sockfd,
+            int client_sockfd = ::accept(this->sockfd,
                                                              reinterpret_cast<sockaddr*>(&client_addr),
                                                              &addr_len);
             if (client_sockfd < 0) {
@@ -2322,7 +2306,7 @@ namespace ssock::sock {
             const char* data = static_cast<const char*>(buf);
 
             while (total_sent < len) {
-                ssize_t sent = internal_net::sys_net_send(this->sockfd, data + total_sent, len - total_sent, 0);
+                ssize_t sent = ::send(this->sockfd, data + total_sent, len - total_sent, 0);
                 if (sent <= 0) {
                     return static_cast<int>(sent);
                 }
@@ -2423,7 +2407,7 @@ namespace ssock::sock {
                 FD_SET(this->sockfd, &readfds);
 
                 if (this->sockfd < 0) throw socket_error("invalid socket descriptor");
-                int ret = internal_net::sys_net_select(this->sockfd + 1, &readfds, nullptr, nullptr,
+                int ret = ::select(this->sockfd + 1, &readfds, nullptr, nullptr,
                                                        timeout_seconds == -1 ? nullptr : &tv);
                 if (ret < 0) throw socket_error("select() failed");
                 if (ret == 0) return {data, sock_recv_status::timeout};
@@ -2435,7 +2419,7 @@ namespace ssock::sock {
                     }
 
                     char buf[8192];
-                    ssize_t received = internal_net::sys_net_recv(this->sockfd, buf, bytes_to_read, 0);
+                    ssize_t received = ::recv(this->sockfd, buf, bytes_to_read, 0);
                     if (received < 0) {
                         if (errno == EINTR) continue;
                         throw socket_error("recv() failed");
@@ -2465,8 +2449,8 @@ namespace ssock::sock {
         }
 
         [[nodiscard]] sock_recv_result primitive_recv() const override {
-            char buf[8192];
             for (;;) {
+                char buf[8192];
                 ssize_t n = ::recv(this->sockfd, buf, sizeof(buf), 0);
                 if (n > 0)
                     return {{buf, buf + n}, sock_recv_status::success};
@@ -2626,7 +2610,7 @@ namespace ssock::sock {
                 return;
             }
 
-            (void)internal_net::sys_net_close(this->sockfd);
+            (void)::close(this->sockfd);
             this->sockfd = -1;
         }
 #endif
@@ -2762,7 +2746,7 @@ namespace ssock::sock {
 }
 
 #ifdef SSOCK_OPENSSL
-namespace ssock::crypto {
+namespace ssock::sock {
 class ssl_sync_sock {
 public:
     enum class mode { client, server };
@@ -3717,7 +3701,7 @@ namespace ssock::network::dns {
 
 			std::vector<network::dns::dns_record> all_records;
 
-			auto send_udp = [&](const std::string &server,
+			auto send_udp = [&query](const std::string &server,
                                 ssock::sock::sock_addr_type family) -> std::optional<std::vector<uint8_t> > {
 				ssock::sock::sock_addr addr(server, 53, family);
 				ssock::sock::sync_sock sock(
@@ -3729,7 +3713,7 @@ namespace ssock::network::dns {
 
 				sock.connect();
 
-		        sock.send((char*)query.data(), query.size());
+		        sock.send(query.data(), query.size());
 
 				auto resp = sock.recv(2, 4096).data;
 
@@ -4156,16 +4140,38 @@ namespace ssock::http {
         std::string body{};
         int timeout{5};
 
+#ifdef SSOCK_OPENSSL
+        using variant_sock = std::variant<sock::sync_sock, sock::ssl_sync_sock>;
+#else
+        using variant_sock = std::variant<sock::sync_sock>;
+#endif
         [[nodiscard]] std::string make_request(const std::string& request) const {
-            sock::sock_addr addr(hostname, port, sock::sock_addr_type::hostname_ipv4);
-            sock::sync_sock sock(addr, sock::sock_type::tcp);
-            sock.connect();
-            sock.send(request);
+            sock::sock_addr addr(hostname, port, sock::sock_addr_type::hostname);
+
+            std::optional<variant_sock> sock{std::nullopt};
+#ifdef SSOCK_OPENSSL
+            if (port == 443) {
+                auto tcp_sock = std::make_unique<sock::sync_sock>(addr, sock::sock_type::tcp);
+                sock.emplace(std::in_place_type<sock::ssl_sync_sock>,
+                             std::move(tcp_sock),
+                             sock::ssl_sync_sock::mode::client);
+            } else {
+                sock.emplace(sock::sync_sock(addr, sock::sock_type::tcp));
+                std::get<sock::sync_sock>(*sock).connect();
+            }
+#else
+            sock.emplace(sock::sync_sock(addr, sock::sock_type::tcp));
+            std::get<sock::sync_sock>(*sock).connect();
+#endif
+
+            auto& s = *sock;
+            std::visit([](auto& sckt){ sckt.connect(); }, s);
+            std::visit([&](auto& sckt) { sckt.send(request.data(), request.size()); }, s);
 
             std::string raw;
             std::string s_headers;
             while (true) {
-                auto result = sock.recv(this->timeout, "\r\n\r\n", 0); // match headers end, no eof limit
+                auto result = std::visit([&](auto& sckt) { return sckt.recv(timeout, "\r\n\r\n", 0); }, s);
                 if (result.status == sock::sock_recv_status::timeout) {
                     throw std::runtime_error("timeout while reading headers");
                 }
@@ -4202,7 +4208,7 @@ namespace ssock::http {
             if (is_chunked) {
                 std::string chunked_data = std::move(raw);
                 while (chunked_data.find("0\r\n\r\n") == std::string::npos) {
-                    std::string chunk = sock.recv(this->timeout, 8192).data;
+                    std::string chunk = std::visit([&](auto& sckt) { return sckt.recv(timeout, 8192); }, s).data;
                     if (chunk.empty()) throw std::runtime_error("connection closed during chunked body");
                     chunked_data += chunk;
                 }
@@ -4210,7 +4216,7 @@ namespace ssock::http {
             } else {
                 s_body = std::move(raw);
                 while (s_body.size() < content_length) {
-                    auto res = sock.recv(30, "", 0);
+                    auto res = std::visit([&](auto& sckt) { return sckt.recv(30, "", 0); }, s);
                     if (res.data.empty()) break;
                     s_body += res.data;
                 }

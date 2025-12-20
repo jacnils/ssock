@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include_directories(/usr/local/include)
 
+find_package(OpenSSL REQUIRED)
 find_package(ssock)
 
 add_executable(

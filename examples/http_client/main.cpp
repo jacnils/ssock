@@ -3,7 +3,7 @@
 #include <ssock.hpp>
 
 void thin_http_abstraction() {
-    auto http_abstr = ssock::http::client("forwarderfactory.com", "/api/get_forwarders", 80,
+    auto http_abstr = ssock::http::client("google.com", "/", 443,
                                          ssock::http::method::GET, ssock::http::version::HTTP_1_1);
 
     http_abstr.set_connection("Close");
