@@ -23,6 +23,7 @@
 #include <variant>
 #include <vector>
 #include <mutex>
+#include <set>
 
 #ifndef SSOCK
 #define SSOCK 1
@@ -532,6 +533,68 @@ namespace ssock::utility {
         std::filesystem::create_directories(base_path);
         return (base_path / cache_filename).string();
     }
+
+	static std::string encode_base64(const std::vector<uint8_t>& data) {
+    	static constexpr std::string_view base64_a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    	std::stringstream ret;
+    	size_t len = data.size();
+    	size_t i = 0;
+
+    	while (i < len) {
+    		uint32_t a = i < len ? static_cast<uint8_t>(data[i++]) : 0;
+    		uint32_t b = i < len ? static_cast<uint8_t>(data[i++]) : 0;
+    		uint32_t c = i < len ? static_cast<uint8_t>(data[i++]) : 0;
+
+    		uint32_t triple = (a << 16) + (b << 8) + c;
+
+    		ret << base64_a[(triple >> 18) & 0x3F]
+					<< base64_a[(triple >> 12) & 0x3F]
+					<< base64_a[(triple >> 6) & 0x3F]
+					<< base64_a[triple & 0x3F];
+    	}
+
+		if (size_t pad = len % 3) {
+    		ret.seekp(-static_cast<int>(3 - pad), std::ios_base::end);
+    		for (size_t j = 0; j < 3 - pad; ++j) {
+    			ret << '=';
+    		}
+    	}
+
+    	return ret.str();
+    }
+
+	static std::vector<uint8_t> decode_base64(const std::string_view& data) {
+    	static constexpr std::string_view base64_a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    	std::vector<uint8_t> ret;
+    	int three{};
+    	uint32_t four{};
+
+    	for (char c : data) {
+    		if (std::isspace(c)) {
+    			continue;
+    		}
+
+    		if ((c == '=') || (c == '\0')) {
+    			break;
+    		}
+
+    		if (std::isalnum(c) || (c == '-') || (c == '_')) {
+    			four = (four << 6) | base64_a.find(c);
+    			three += 6;
+
+    			if (three >= 8) {
+    				three -= 8;
+    				ret.push_back(static_cast<uint8_t>((four >> three) & 0xFF));
+    			}
+    		} else {
+    			throw std::runtime_error{"invalid string"};
+    		}
+    	}
+
+    	return ret;
+    }
 }
 
 /**
@@ -574,12 +637,12 @@ namespace ssock::network {
      * @note If you are unsure but have a hostname, use hostname_ipv4.
      */
     enum class sock_addr_type {
-        ipv4 = 0, /* IPv4 address */
-        ipv6 = 1, /* IPv6 address */
-        hostname_ipv4 = 2, /* Hostname; resolve to IPv4 address */
-        hostname_ipv6 = 3, /* Hostname; resolve to IPv6 address */
-        hostname = 4, /* Hostname; resolve to IPv4 address */
-        filename = 5 /* File path; used for Unix domain sockets */
+        ipv4, /* IPv4 address */
+        ipv6, /* IPv6 address */
+        hostname_ipv4, /* Hostname; resolve to IPv4 address */
+        hostname_ipv6, /* Hostname; resolve to IPv6 address */
+        hostname, /* Hostname; resolve to IPv4 address */
+        filename /* File path; used for Unix domain sockets */
     };
 
     /**
@@ -1728,33 +1791,42 @@ namespace ssock::sock {
          * @param t The address type (ipv4, ipv6, hostname_ipv4, hostname_ipv6).
          */
         sock_addr(const std::string& hostname, int port, sock_addr_type t) : hostname(hostname), port(port), type(t) {
-            const auto resolve_host = [](const std::string& h, bool t) -> std::string {
-                try {
-                    auto ip_list = internal_net::get_a_aaaa_from_hostname(h);
-                    auto ip = t ? ip_list.get_ipv6() : ip_list.get_ipv4();
-                    return ip;
-                } catch (const std::exception&) {
-                    return {};
-                }
-            };
+        	const auto resolve_host = [](const std::string& h, int max_retries = 3) -> std::pair<std::string, std::string> {
+        		for (int attempt = 0; attempt < max_retries; ++attempt) {
+        			try {
+        				auto ip_list = internal_net::get_a_aaaa_from_hostname(h);
+        				std::string v4 = ip_list.contains_ipv4() ? ip_list.get_ipv4() : "";
+        				std::string v6 = ip_list.contains_ipv6() ? ip_list.get_ipv6() : "";
+
+        				if (!v4.empty() || !v6.empty()) {
+        					return {v4, v6};
+        				}
+        			} catch (const std::exception& e) {
+        				throw std::runtime_error{"dns resolving failed with exception: " + std::string(e.what())};
+        			}
+
+        			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        		}
+
+        		return {"", ""}; // failed after retries
+        	};
 
             if (type == sock_addr_type::hostname) {
-                ip = resolve_host(hostname, true);
+                auto ip_list = resolve_host(hostname, 3);
                 type = ssock::sock::sock_addr_type::ipv6;
 
-                if (!ssock::network::usable_ipv6_address_exists()) {
-                    ip.clear();
-                }
-
-                if (ip.empty()) {
-                    ip = resolve_host(hostname, false);
-                    type = ssock::sock::sock_addr_type::ipv4;
-                }
+            	if (!ip_list.second.empty() && ssock::network::usable_ipv6_address_exists()) {
+            		ip = ip_list.second;
+            		type = ssock::sock::sock_addr_type::ipv6;
+            	} else {
+            		ip = ip_list.first;
+            		type = ssock::sock::sock_addr_type::ipv4;
+            	}
             } else if (type == sock_addr_type::hostname_ipv4) {
-                ip = resolve_host(hostname, false);
+                ip = resolve_host(hostname, 3).first;
                 type = ssock::sock::sock_addr_type::ipv4;
             } else if (type == sock_addr_type::hostname_ipv6) {
-                ip = resolve_host(hostname, true);
+                ip = resolve_host(hostname, 3).second;
                 type = ssock::sock::sock_addr_type::ipv6;
             } else if (type == sock_addr_type::ipv4 || type == sock_addr_type::ipv6) {
                 ip = hostname;
@@ -2750,14 +2822,22 @@ namespace ssock::sock {
 class ssl_sync_sock {
 public:
     enum class mode { client, server };
+	enum class version {
+		SSL_2 = SSL2_VERSION,
+		SSL_3 = SSL3_VERSION,
+		TLS_1_1 = TLS1_1_VERSION,
+		TLS_1_2 = TLS1_2_VERSION,
+		TLS_1_3 = TLS1_3_VERSION,
+	};
 
     explicit ssl_sync_sock(std::unique_ptr<sock::sync_sock> underlying,
-                           mode ssl_mode,
-                           const std::string& cert_path = "",
-                           const std::string& key_path = "")
+                           mode ssl_mode, version ssl_version = version::TLS_1_2,
+                           std::string cert_path = "",
+                           std::string key_path = "")
         : underlying_sock_(std::move(underlying)),
-          ssl_mode_(ssl_mode),
-          cert_path_(cert_path), key_path_(key_path)
+	      ssl_mode_(ssl_mode),
+          version_(ssl_version),
+          cert_path_(std::move(cert_path)), key_path_(std::move(key_path))
     {
         init_openssl_once();
         create_ssl_context();
@@ -2775,17 +2855,20 @@ public:
 
     ~ssl_sync_sock() { close(); }
 
-    void connect() {
+    void connect() const {
         if (ssl_mode_ != mode::client)
             throw std::runtime_error("connect() only valid for client mode");
         underlying_sock_->connect();
-        perform_handshake();
     }
 
-    void bind() { underlying_sock_->bind(); }
-    void unbind() { underlying_sock_->unbind(); }
-    void listen(int backlog) { underlying_sock_->listen(backlog); }
-    void listen() { underlying_sock_->listen(); }
+    void bind() const { underlying_sock_->bind(); }
+    void unbind() const { underlying_sock_->unbind(); }
+    void listen(int backlog) const { underlying_sock_->listen(backlog); }
+    void listen() const { underlying_sock_->listen(); }
+	bool is_secure() const {
+    	return ssl_
+		&& SSL_is_init_finished(ssl_);
+    }
 
     std::unique_ptr<ssl_sync_sock> accept() {
         if (ssl_mode_ != mode::server)
@@ -2795,12 +2878,12 @@ public:
 
         auto child = std::make_unique<ssl_sync_sock>(std::move(new_sock),
                                                      mode::server,
+                                                     version_,
                                                      cert_path_, key_path_);
-        child->perform_handshake();
         return child;
     }
 
-    int send(const void* buf, size_t len) {
+    int send(const void* buf, size_t len) const {
         ensure_ready();
 
         size_t offset = 0;
@@ -2830,18 +2913,20 @@ public:
         return static_cast<int>(len);
     }
 
-    void send(const std::string& buf) { send(buf.data(), buf.size()); }
+    void send(const std::string& buf) const {
+	    static_cast<void>(send(buf.data(), buf.size()));
+    }
 
-    sock::sock_recv_result recv(int timeout_seconds) const {
+    sock_recv_result recv(int timeout_seconds) const {
         return recv_internal(timeout_seconds, nullptr, 0);
     }
-    sock::sock_recv_result recv(int timeout_seconds, const std::string& match) const {
+    sock_recv_result recv(int timeout_seconds, const std::string& match) const {
         return recv_internal(timeout_seconds, &match, 0);
     }
-    sock::sock_recv_result recv(int timeout_seconds, const std::string& match, size_t eof) const {
+    sock_recv_result recv(int timeout_seconds, const std::string& match, size_t eof) const {
         return recv_internal(timeout_seconds, &match, eof);
     }
-    sock::sock_recv_result recv(int timeout_seconds, size_t eof) const {
+    sock_recv_result recv(int timeout_seconds, size_t eof) const {
         return recv_internal(timeout_seconds, nullptr, eof);
     }
 
@@ -2862,9 +2947,30 @@ public:
             ctx_ = nullptr;
         }
 
-        if (underlying_sock_) {
+        if (underlying_sock_) { // should not be required but just in case
             underlying_sock_->close();
         }
+    }
+
+	void perform_handshake() {
+    	while (!SSL_is_init_finished(ssl_)) {
+    		int ret = SSL_do_handshake(ssl_);
+    		drain_write_bio();
+
+    		if (ret == 1)
+    			break;
+
+    		int err = SSL_get_error(ssl_, ret);
+    		if (err == SSL_ERROR_WANT_READ) {
+    			feed_read_bio_blocking();
+    		} else if (err == SSL_ERROR_WANT_WRITE) {
+    			continue;
+    		} else {
+    			throw_ssl_error("TLS handshake failed");
+    		}
+    	}
+
+    	handshake_complete_ = true;
     }
 
 private:
@@ -2873,6 +2979,7 @@ private:
 
     std::unique_ptr<sock::sync_sock> underlying_sock_;
     mode ssl_mode_;
+	version version_;
     std::string cert_path_;
     std::string key_path_;
 
@@ -2901,7 +3008,7 @@ private:
         ctx_ = SSL_CTX_new(method);
         if (!ctx_) throw_ssl_error("SSL_CTX_new failed");
 
-        SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
+        SSL_CTX_set_min_proto_version(ctx_, static_cast<long>(version_));
 
         if (ssl_mode_ == mode::server) {
             if (SSL_CTX_use_certificate_file(ctx_, cert_path_.c_str(), SSL_FILETYPE_PEM) <= 0)
@@ -2912,19 +3019,44 @@ private:
             SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, nullptr);
         	SSL_CTX_set_default_verify_paths(ctx_);
 
-        	const char* ca_path = std::getenv("SSL_CERT_FILE");
-        	if (ca_path) {
-        		if (!SSL_CTX_load_verify_locations(ctx_, ca_path, NULL)) {
-        			throw std::runtime_error{"failed to load ca bundle from environment variable"};
+			if (const char* ca_path = std::getenv("SSL_CERT_FILE")) {
+        		if (!SSL_CTX_load_verify_locations(ctx_, ca_path, nullptr)) {
+        			throw std::runtime_error{"failed to load ca bundle from environment variable (SSL_CERT_FILE=" + std::string(ca_path) + ")"};
         		}
         	}
 
         	if (!cert_path_.empty()) {
         		SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-        		if(!SSL_CTX_load_verify_locations(ctx_, cert_path_.c_str(), NULL)) {
-        			throw std::runtime_error{"Failed to load CA bundle"};
+        		if (!ctx) {
+        			throw std::runtime_error{"Failed to create SSL_CTX"};
+        		}
+
+        		if (SSL_CTX_load_verify_locations(ctx, cert_path_.c_str(), nullptr) != 1) {
+        			BIO* bio = BIO_new_mem_buf(cert_path_.data(), static_cast<int>(cert_path_.size()));
+        			if (!bio) {
+        				SSL_CTX_free(ctx);
+        				throw std::runtime_error{"Failed to create BIO for in-memory certificate"};
+        			}
+
+        			X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+        			BIO_free(bio);
+
+        			if (!cert) {
+        				SSL_CTX_free(ctx);
+        				throw std::runtime_error{"Failed to parse certificate data"};
+        			}
+
+        			X509_STORE* store = SSL_CTX_get_cert_store(ctx);
+        			if (X509_STORE_add_cert(store, cert) != 1) {
+        				X509_free(cert);
+        				SSL_CTX_free(ctx);
+        				throw std::runtime_error{"Failed to add certificate to store"};
+        			}
+
+        			X509_free(cert);
         		}
         	}
+
 
             X509_VERIFY_PARAM_set1_host(SSL_CTX_get0_param(ctx_),
                                            underlying_sock_->get_addr().get_hostname().c_str(),
@@ -2954,26 +3086,6 @@ private:
     }
 
     bool handshake_complete_ = false;
-    void perform_handshake() {
-        while (!SSL_is_init_finished(ssl_)) {
-            int ret = SSL_do_handshake(ssl_);
-            drain_write_bio();
-
-            if (ret == 1)
-                break;
-
-            int err = SSL_get_error(ssl_, ret);
-            if (err == SSL_ERROR_WANT_READ) {
-                feed_read_bio_blocking();
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                continue;
-            } else {
-                throw_ssl_error("TLS handshake failed");
-            }
-        }
-
-        handshake_complete_ = true;
-    }
 
     void drain_write_bio() const {
         char buf[4096];
@@ -2986,7 +3098,7 @@ private:
 
     bool read_eof_ = false;
     bool transport_eof_ = false;
-    void feed_read_bio_blocking() {
+    void feed_read_bio_blocking() const {
         auto res = underlying_sock_->primitive_recv();
 
         if (res.status == sock::sock_recv_status::closed) {
@@ -3809,9 +3921,6 @@ namespace ssock::network::dns {
 				}
 			}
 
-			if (!success)
-				throw dns_error("all DNS queries failed.");
-
 			if (all_records.empty())
 				throw dns_error("no DNS records found for: " + hostname);
 
@@ -3837,8 +3946,15 @@ namespace ssock::internal_net {
 
         ssock::network::dns::sync_dns_resolver resolver(nameservers);
 
-        auto records = resolver.query_records(hostname, ssock::network::dns::dns_record_type::A);
-        auto records_v6 = resolver.query_records(hostname, ssock::network::dns::dns_record_type::AAAA);
+    	std::vector<network::dns::dns_record> records;
+    	std::vector<network::dns::dns_record> records_v6;
+
+    	try {
+    		records = resolver.query_records(hostname, ssock::network::dns::dns_record_type::A);
+    	} catch (std::exception&) {}
+    	try {
+    		records_v6 = resolver.query_records(hostname, ssock::network::dns::dns_record_type::AAAA);
+    	} catch (std::exception&) {}
 
         std::string v4{};
         std::string v6{};
@@ -4166,6 +4282,15 @@ namespace ssock::http {
 
             auto& s = *sock;
             std::visit([](auto& sckt){ sckt.connect(); }, s);
+#ifdef SSOCK_OPENSSL
+        	std::visit([]<typename T0>(T0& sckt) { // handshake only viable for ssl_sync_sock
+				using T = std::decay_t<T0>;
+				if constexpr (std::is_same_v<T, sock::ssl_sync_sock>) {
+					sckt.perform_handshake();
+				}
+			}, s);
+#endif
+
             std::visit([&](auto& sckt) { sckt.send(request.data(), request.size()); }, s);
 
             std::string raw;
@@ -4471,6 +4596,7 @@ namespace ssock::http {
          */
         struct server_settings {
             int port{8080};
+        	struct session_settings {};
             bool enable_session{true};
             std::string session_directory{"./"};
             std::string session_cookie_name{"session_id"};
